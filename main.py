@@ -34,7 +34,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")
 TRUTHSOCIAL_USERNAME = os.getenv("TRUTHSOCIAL_USERNAME", "realDonaldTrump")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_MINUTES", "5"))
-SEND_ON_FIRST_RUN = os.getenv("SEND_ON_FIRST_RUN", "false").lower() in ("true", "1", "yes")
+SEND_ON_FIRST_RUN = os.getenv("SEND_ON_FIRST_RUN", "true").lower() in ("true", "1", "yes")
+log.info("Config: SEND_ON_FIRST_RUN=%s", SEND_ON_FIRST_RUN)
 
 DB_PATH = Path(__file__).parent / "state.db"
 
@@ -727,7 +728,10 @@ def main():
             if not posts:
                 posts = fetch_posts_via_playwright(browser, limit=5)
 
-            if SEND_ON_FIRST_RUN and posts:
+            should_send = SEND_ON_FIRST_RUN
+            log.info("should_send=%s", should_send)
+
+            if should_send and posts:
                 # Отправляем только последний (самый новый) пост
                 p = posts[0]
                 post_id = p["id"]
