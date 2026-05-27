@@ -491,6 +491,74 @@ def fetch_posts_via_api(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10) -
         return []
 
 
+def fetch_posts_via_rsshub(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10) -> list[dict]:
+    """Получает посты через RSSHub (обходит Cloudflare)."""
+    url = f"https://rsshub.app/truthsocial/user/{username}"
+    try:
+        log.info("RSSHub fetch: %s", url)
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        log.info("RSSHub status: %d, len=%d", r.status_code, len(r.text))
+
+        if r.status_code != 200:
+            log.warning("RSSHub failed: %d", r.status_code)
+            return []
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        items = soup.find_all("item")
+        if not items:
+            items = soup.find_all("entry")  # Atom format
+        log.info("RSSHub: found %d items", len(items))
+
+        posts = []
+        for item in items[:limit]:
+            title = item.find("title")
+            link = item.find("link")
+            pub_date = item.find("pubdate") or item.find("published") or item.find("updated")
+            description = item.find("description") or item.find("content") or item.find("summary")
+
+            # Извлекаем текст
+            text = ""
+            if description:
+                text = strip_html(description.get_text(strip=True) if description.string is None else str(description.string))
+            if not text and title:
+                text = title.get_text(strip=True)
+
+            if not text or len(text) < 10:
+                continue
+
+            # Извлекаем ссылку
+            post_url = ""
+            if link:
+                post_url = link.get("href", "") or (link.string if link.string else "")
+            if not post_url and title:
+                a_tag = title.find("a")
+                if a_tag:
+                    post_url = a_tag.get("href", "")
+
+            # Извлекаем дату
+            date_str = ""
+            if pub_date:
+                date_str = (pub_date.string if pub_date.string else pub_date.get_text(strip=True))[:10]
+
+            # Генерируем ID из URL или текста
+            post_id = post_url.split("/")[-1] if post_url else str(hash(text))[:16]
+
+            posts.append({
+                "id": post_id,
+                "text": text,
+                "url": post_url,
+                "date": date_str,
+                "media": [],
+            })
+
+        log.info("✅ RSSHub: got %d posts", len(posts))
+        return posts
+
+    except Exception as e:
+        log.error("RSSHub error: %s", e)
+        return []
+
+
 def take_screenshot(pw_browser, post_url: str) -> bytes | None:
     """Делает скриншот поста по его URL."""
     if not post_url:
@@ -559,10 +627,15 @@ def take_screenshot(pw_browser, post_url: str) -> bytes | None:
 def poll_once(pw_browser):
     log.info("Polling @%s ...", TRUTHSOCIAL_USERNAME)
 
-    # Метод 1: Прямой API-запрос (быстрый, без браузера)
-    posts = fetch_posts_via_api(TRUTHSOCIAL_USERNAME, limit=10)
+    # Метод 1: RSSHub (быстрый, обходит Cloudflare)
+    posts = fetch_posts_via_rsshub(TRUTHSOCIAL_USERNAME, limit=10)
 
-    # Метод 2: Playwright (fallback)
+    # Метод 2: Прямой API-запрос (curl_cffi)
+    if not posts:
+        log.info("RSSHub вернул 0 постов, пробуем API...")
+        posts = fetch_posts_via_api(TRUTHSOCIAL_USERNAME, limit=10)
+
+    # Метод 3: Playwright (fallback)
     if not posts:
         log.info("API вернул 0 постов, пробуем Playwright...")
         posts = fetch_posts_via_playwright(pw_browser, limit=10)
@@ -647,8 +720,10 @@ def main():
     if get_last_id() is None:
         log.info("First run — marking existing posts...")
         try:
-            # Пробуем API, потом Playwright
-            posts = fetch_posts_via_api(TRUTHSOCIAL_USERNAME, limit=5)
+            # Пробуем RSSHub, потом API, потом Playwright
+            posts = fetch_posts_via_rsshub(TRUTHSOCIAL_USERNAME, limit=5)
+            if not posts:
+                posts = fetch_posts_via_api(TRUTHSOCIAL_USERNAME, limit=5)
             if not posts:
                 posts = fetch_posts_via_playwright(browser, limit=5)
             for p in posts:
