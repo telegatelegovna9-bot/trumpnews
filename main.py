@@ -54,6 +54,17 @@ log.info("Config: SEND_ON_FIRST_RUN=%s", SEND_ON_FIRST_RUN)
 
 if PROXY_ENABLED and PROXY_URL:
     log.info("Proxy: ENABLED %s", PROXY_URL.split("@")[-1] if "@" in PROXY_URL else PROXY_URL)
+    # Тестируем прокси
+    try:
+        proxy_dict = {"https": PROXY_URL, "http": PROXY_URL}
+        test_r = requests.get("https://api.ipify.org?format=json", timeout=10, proxies=proxy_dict)
+        if test_r.status_code == 200:
+            ip = test_r.json().get("ip", "?")
+            log.info("✅ Proxy test: your IP is %s", ip)
+        else:
+            log.warning("⚠️ Proxy test failed: status %d", test_r.status_code)
+    except Exception as e:
+        log.warning("⚠️ Proxy test error: %s", e)
 else:
     log.info("Proxy: DISABLED")
 
