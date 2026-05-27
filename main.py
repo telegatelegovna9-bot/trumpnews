@@ -35,7 +35,6 @@ TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")
 TRUTHSOCIAL_USERNAME = os.getenv("TRUTHSOCIAL_USERNAME", "realDonaldTrump")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_MINUTES", "5"))
 SEND_ON_FIRST_RUN = os.getenv("SEND_ON_FIRST_RUN", "true").lower() in ("true", "1", "yes")
-log.info("Config: SEND_ON_FIRST_RUN=%s", SEND_ON_FIRST_RUN)
 
 DB_PATH = Path(__file__).parent / "state.db"
 
@@ -44,6 +43,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("truth2tg")
+log.info("Config: SEND_ON_FIRST_RUN=%s", SEND_ON_FIRST_RUN)
 
 # ─── Database ──────────────────────────────────────────────────────────────────
 
