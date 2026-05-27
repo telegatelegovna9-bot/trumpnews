@@ -1,113 +1,112 @@
-# Truth Social → Telegram Monitor
+# Truth Social → Telegram Bot
 
 Мониторинг постов Donald Trump на Truth Social с автоматической отправкой в Telegram.
 
 ## Что делает бот
 
-- 🔄 Каждые 5 минут проверяет новые посты на Truth Social
-- 🇺🇸 → 🇷🇺 Автоматически переводит посты на русский
-- 🎭 Sentiment-анализ тональности каждого поста (позитив/негатив/нейтрально)
-- 📎 Показывает наличие медиа-вложений
+- 🖼️ **Скриншот** каждого нового поста (как на сайте)
+- 🇷🇺 **Перевод** на русский язык
+- 🎭 **Sentiment-анализ** тональности (позитив/негатив/нейтрально)
 - 🔗 Ссылка на оригинальный пост
+- ♻️ Работает 24/7, проверяет каждые 5 минут
 
-## Пример сообщения
+## Пример сообщения в Telegram
 
 ```
-🔴 Новый пост Truth Social
-📅 2025-01-15 | 🟢 Тон: позитивный
+[СКРИНШОТ ПОСТА]
 
-🇺🇸 Оригинал:
-Great news for America! Our economy is booming like never before!
+🔴 Пост из Truth Social
+📅 2025-01-15 | 🟢 Тон: позитивный
 
 🇷🇺 Перевод:
 Отличные новости для Америки! Наша экономика процветает как никогда раньше!
 
-🔗 Открыть в Truth Social
+🔗 Открыть оригинал
 ```
+
+## Как работает
+
+1. **Playwright** (headless Chrome) загружает страницу профиля Truth Social
+2. Извлекает текст и делает **скриншот** каждого поста
+3. Переводит текст на русский через Google Translate
+4. Отправляет **скриншот + перевод** в Telegram
+5. SQLite хранит ID отправленных постов — дубликатов не будет
+
+> Playwright — это настоящий браузер, поэтому обходит Cloudflare и все блокировки.
 
 ## Быстрый старт
 
 ### 1. Создай Telegram бота
 
-1. Открой [@BotFather](https://t.me/BotFather) в Telegram
-2. Отправь `/newbot`
-3. Следуй инструкциям, получи **токен бота**
-4. Добавь бота в канал/группу или напиши ему `/start`
-5. Узнай **Chat ID**:
-   - Для личных сообщений: напиши боту, потом открой `https://api.telegram.org/bot<TOKEN>/getUpdates` — там будет `"chat":{"id":123456}`
-   - Для канала: добавь бота как админа канала, потом используй `@channel_name` или числовой ID
-   - **Для группы с темами (форум)**: см. инструкцию ниже
+1. [@BotFather](https://t.me/BotFather) → `/newbot` → получи токен
+2. Добавь бота в группу/канал
+3. Узнай Chat ID (см. ниже)
 
-#### Группа с темами (форум)
+### 2. Узнай Chat ID и Thread ID
 
-Если группа разделена на темы/ветки:
-1. Добавь бота в группу как администратора
-2. **В нужной теме** напиши боту `/start`
-3. Открой `https://api.telegram.org/bot<TOKEN>/getUpdates`
-4. Найди `"message_thread_id": 123` — это ID темы
-5. Добавь в `.env`:
-   ```env
-   TELEGRAM_THREAD_ID=123
-   ```
+**Chat ID** — ID группы/канала:
+- Для личных сообщений: напиши боту, открой `https://api.telegram.org/bot<TOKEN>/getUpdates`
+- Для группы: используй [@RawDataBot](https://t.me/RawDataBot)
 
-> Без `TELEGRAM_THREAD_ID` бот пишет в **основной чат** группы (не в тему).
+**Thread ID** (для группы с темами):
+- Добавь [@RawDataBot](https://t.me/RawDataBot) в группу
+- Напиши сообщение в нужной теме
+- RawDataBot покажет `message_thread_id`
 
-### 2. Настрой переменные окружения
-
-Скопируй `.env.example` в `.env`:
+### 3. Настрой переменные
 
 ```bash
 cp .env.example .env
 ```
 
-Заполни:
 ```env
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
-TELEGRAM_CHAT_ID=123456789
-TELEGRAM_THREAD_ID=123          # опционально, для группы с темами
+TELEGRAM_CHAT_ID=-1003156829333
+TELEGRAM_THREAD_ID=44469
 TRUTHSOCIAL_USERNAME=realDonaldTrump
 POLL_INTERVAL_MINUTES=5
 ```
 
-### 3. Запуск локально
+### 4. Запуск локально
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium
 python main.py
 ```
 
-### 4. Деплой на Railway
+### 5. Деплой на Railway
 
 1. Залей проект на GitHub
-2. Зайди на [railway.app](https://railway.app)
-3. New Project → Deploy from GitHub repo
-4. Добавь переменные окружения (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) в Settings → Variables
-5. Railway автоматически соберёт Docker-образ и запустит
+2. [railway.app](https://railway.app) → New Project → Deploy from GitHub repo
+3. Добавь переменные окружения в Settings → Variables
+4. Railway соберёт Docker (с Playwright + Chromium) и запустит
 
-> **Volume для SQLite**: Чтобы база данных не сбрасывалась при рестарте, добавь Volume в Railway:
-> Settings → Volumes → Mount Path: `/app` (или `/app/state.db` если Railway поддерживает файлы)
+> **Volume**: Для сохранения SQLite базы добавь Volume в Railway (Settings → Volumes → Mount Path: `/app`)
 
 ## Структура проекта
 
 ```
 trump mode/
 ├── main.py              # Основной код бота
-├── requirements.txt     # Python зависимости
-├── Dockerfile           # Для деплоя на Railway
-├── .env.example         # Шаблон переменных окружения
-├── .env                 # Твои реальные переменные (не коммитить!)
-└── state.db             # SQLite — хранит состояние (создаётся автоматически)
+├── requirements.txt     # Python зависимости (включая Playwright)
+├── Dockerfile           # Docker с Chromium для Railway
+├── railway.toml         # Конфиг деплоя
+├── .env.example         # Шаблон переменных
+├── .gitignore
+└── README.md
 ```
 
-## Как работает
+## Технологии
 
-1. При первом запуске бот помечает существующие посты как «отправленные» (чтобы не спамить старыми)
-2. Каждые 5 минут опрашивает Truth Social (с автоматическим fallback между методами):
-   - **Прямой API** — Mastodon-совместимый API Truth Social (работает с residential IP)
-   - **RSSHub** — публичный RSS-сервис (работает с серверов)
-   - **Nitter** — зеркала Truth Social (резервный метод)
-3. Новые посты → перевод → sentiment-анализ → отправка в Telegram
-4. ID отправлен��ых постов хранятся в SQLite — дубликатов не будет
+| Компонент | Технология |
+|-----------|-----------|
+| Браузер | Playwright (headless Chromium) |
+| Перевод | Google Translate (deep-translator) |
+| Sentiment | TextBlob |
+| Планировщик | APScheduler |
+| Хранение | SQLite |
+| Деплой | Railway (Docker) |
 
 ## Дополнительные идеи
 
@@ -115,3 +114,4 @@ trump mode/
 - [ ] Дайджест за день/неделю
 - [ ] Фильтрация по ключевым словам
 - [ ] Web dashboard для истории постов
+- [ ] Видео-посты → скриншот превью + ссылка

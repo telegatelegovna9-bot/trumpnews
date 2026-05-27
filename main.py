@@ -1,21 +1,18 @@
 """
 Truth Social → Telegram Bot
-Мониторит новые посты с Truth Social и отправляет в Telegram с переводом и sentiment-анализом.
+Мониторит новые посты, делает скриншоты и отправляет в Telegram с переводом.
 
-Поддерживает несколько методов получения постов (автоматический fallback):
-1. Прямой Truth Social API с Cloudflare bypass (через cookies)
-2. Скрейпинг HTML-страницы профиля (извлечение встроенного JSON)
-3. RSSHub
-4. Nitter
+Использует Playwright (headless Chrome) для:
+- Обхода Cloudflare и любых блокировок
+- Скриншотов отдельных постов
+- Извлечения текста из рендеренной страницы
 """
 
 import os
 import re
-import json
 import logging
 import sqlite3
 import time
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +20,7 @@ import requests
 from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
+from playwright.sync_api import sync_playwright, Page
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ─── Config ────────────────────────────────────────────────────────────────────
@@ -97,303 +95,211 @@ def set_last_id(post_id: str):
     conn.commit()
     conn.close()
 
-# ─── Truth Social Fetching ─────────────────────────────────────────────────────
+# ─── Playwright Browser ───────────────────────────────────────────────────────
 
-class TruthSocialFetcher:
-    """Пробует разные методы получения постов из Truth Social."""
+class Browser:
+    """Управляет headless Chrome через Playwright."""
 
-    def __init__(self, username: str):
-        self.username = username
-        self._working_method = None
-        self._session = self._make_session()
+    def __init__(self):
+        self._pw = None
+        self._browser = None
+        self._context = None
 
-    def _make_session(self) -> requests.Session:
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
-        return s
+    def start(self):
+        log.info("Starting Playwright browser...")
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        self._context = self._browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            ),
+        )
+        log.info("✅ Browser started.")
 
-    def fetch(self, limit: int = 20) -> list[dict]:
-        """Возвращает список постов в едином формате."""
-        methods = [
-            ("direct_api", self._fetch_direct_api),
-            ("html_scrape", self._fetch_html_scrape),
-            ("rsshub", self._fetch_rsshub),
-            ("nitter", self._fetch_nitter),
-        ]
+    def stop(self):
+        if self._context:
+            self._context.close()
+        if self._browser:
+            self._browser.close()
+        if self._pw:
+            self._pw.stop()
+        log.info("Browser stopped.")
 
-        if self._working_method:
-            methods.sort(key=lambda x: 0 if x[0] == self._working_method else 1)
+    def new_page(self) -> Page:
+        return self._context.new_page()
 
-        for name, method in methods:
-            try:
-                posts = method(limit)
-                if posts:
-                    if self._working_method != name:
-                        log.info("✅ Method '%s' works! Switching to it.", name)
-                        self._working_method = name
-                    return posts
-                else:
-                    log.debug("Method '%s' returned empty.", name)
-            except Exception as e:
-                log.warning("Method '%s' failed: %s", name, e)
-
-        log.error("❌ All methods failed!")
-        return []
-
-    def _fetch_direct_api(self, limit: int) -> list[dict]:
-        """Метод 1: Mastodon API с Cloudflare cookie bypass."""
-        # Сначала посещаем главную для получения cookies
+    def fetch_posts(self, username: str, limit: int = 10) -> list[dict]:
+        """
+        Загружает профиль Truth Social и извлекает посты.
+        Возвращает: [{"id": str, "text": str, "url": str, "date": str}, ...]
+        """
+        page = self.new_page()
         try:
-            self._session.get("https://truthsocial.com/", timeout=10)
-        except Exception:
-            pass
+            url = f"https://truthsocial.com/@{username}"
+            log.info("Loading %s ...", url)
+            page.goto(url, wait_until="networkidle", timeout=30000)
 
-        resp = self._session.get(
-            "https://truthsocial.com/api/v1/accounts/lookup",
-            params={"acct": self.username},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        account_id = resp.json()["id"]
+            # Ждём пока посты загрузятся
+            page.wait_for_timeout(3000)
 
-        resp = self._session.get(
-            f"https://truthsocial.com/api/v1/accounts/{account_id}/statuses",
-            params={"limit": limit},
-            timeout=15,
-        )
-        resp.raise_for_status()
+            # Пробуем разные селекторы для постов
+            posts = self._extract_posts(page, username, limit)
 
-        posts = []
-        for item in resp.json():
-            text = self._strip_html(item.get("content", ""))
-            if not text:
-                continue
-            posts.append({
-                "id": item["id"],
-                "text": text,
-                "url": item.get("url", f"https://truthsocial.com/@{self.username}/{item['id']}"),
-                "date": item.get("created_at", "")[:10],
-                "media": [m.get("type", "unknown") for m in item.get("media_attachments", [])],
-            })
-        return posts
+            if not posts:
+                # Если не нашли — скроллим вниз и пробуем снова
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                page.wait_for_timeout(2000)
+                posts = self._extract_posts(page, username, limit)
 
-    def _fetch_html_scrape(self, limit: int) -> list[dict]:
-        """Метод 2: Скрейпинг HTML-страницы профиля."""
-        url = f"https://truthsocial.com/@{self.username}"
-        resp = self._session.get(url, timeout=20)
-        resp.raise_for_status()
+            log.info("Found %d posts on page.", len(posts))
+            return posts
 
-        html = resp.text
-        log.info("HTML scrape: got %d bytes, status %d", len(html), resp.status_code)
-
-        # Ищем встроенный JSON в script тегах (Next.js / React pattern)
-        # Вариант 1: __NEXT_DATA__
-        match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-        if match:
+        except Exception as e:
+            log.error("Failed to fetch posts: %s", e)
+            # Сохраняем скриншот для дебага
             try:
-                data = json.loads(match.group(1))
-                return self._extract_from_next_data(data, limit)
-            except Exception as e:
-                log.warning("Failed to parse __NEXT_DATA__: %s", e)
+                page.screenshot(path="/app/debug_page.png")
+                log.info("Debug screenshot saved to /app/debug_page.png")
+            except Exception:
+                pass
+            return []
+        finally:
+            page.close()
 
-        # Вариант 2: Ищем JSON с постами в любом script теге
-        script_blocks = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
-        for block in script_blocks:
-            if '"content"' in block and '"account"' in block:
-                # Похоже на данные постов
-                try:
-                    # Пытаемся найти JSON-массив
-                    json_match = re.search(r'\[.*?"content".*?\]', block, re.DOTALL)
-                    if json_match:
-                        data = json.loads(json_match.group())
-                        return self._extract_statuses(data, limit)
-                except Exception:
-                    pass
+    def _extract_posts(self, page: Page, username: str, limit: int) -> list[dict]:
+        """Извлекает посты из рендеренной страницы."""
+        posts = []
 
-        # Вариант 3: Ищем ссылки на посты в HTML и парсим их
-        post_links = re.findall(rf'href="/@{self.username}/(\d+)"', html)
-        if post_links:
-            log.info("HTML scrape: found %d post links", len(post_links))
-            # Пытаемся получить посты через API с cookies
-            posts = []
-            for post_id in list(set(post_links))[:limit]:
-                try:
-                    resp = self._session.get(
-                        f"https://truthsocial.com/api/v1/statuses/{post_id}",
-                        timeout=10,
-                    )
-                    if resp.status_code == 200:
-                        item = resp.json()
-                        text = self._strip_html(item.get("content", ""))
-                        if text:
-                            posts.append({
-                                "id": item["id"],
-                                "text": text,
-                                "url": item.get("url", f"https://truthsocial.com/@{self.username}/{post_id}"),
-                                "date": item.get("created_at", "")[:10],
-                                "media": [m.get("type", "unknown") for m in item.get("media_attachments", [])],
-                            })
-                except Exception:
+        # Селекторы для Truth Social (Mastodon-based UI)
+        # Попробуем несколько вариантов
+        selectors = [
+            'article[data-testid="status"]',
+            'div.status-wrapper',
+            'article.status',
+            'div[class*="status"]',
+            'div[class*="post"]',
+        ]
+
+        elements = []
+        used_selector = None
+        for sel in selectors:
+            elements = page.query_selector_all(sel)
+            if elements:
+                used_selector = sel
+                log.info("Found %d elements with selector: %s", len(elements), sel)
+                break
+
+        if not elements:
+            # Fallback: ищем статьи на странице
+            elements = page.query_selector_all("article")
+            if elements:
+                used_selector = "article"
+                log.info("Fallback: found %d <article> elements", len(elements))
+
+        for i, el in enumerate(elements[:limit]):
+            try:
+                # Извлекаем текст
+                text_el = el.query_selector('[class*="status-content"], [class*="post-content"], .e-content, [class*="content"]')
+                if not text_el:
+                    text_el = el  # берём весь элемент
+
+                raw_text = text_el.inner_text().strip()
+                if not raw_text or len(raw_text) < 10:
                     continue
-            return posts
 
-        # Вариант 4: Парсим текст постов из HTML напрямую
-        # Truth Social рендерит посты с data-атрибутами или определёнными CSS-классами
-        post_texts = re.findall(r'class="[^"]*status-content[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL)
-        if not post_texts:
-            post_texts = re.findall(r'class="[^"]*post[^"]*content[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL)
+                # Извлекаем ссылку на пост
+                link_el = el.query_selector('a[href*="/@' + username + '/"]')
+                post_url = ""
+                post_id = f"post_{i}_{hash(raw_text[:100])}"
 
-        if post_texts:
-            log.info("HTML scrape: found %d post text blocks", len(post_texts))
-            posts = []
-            for i, raw in enumerate(post_texts[:limit]):
-                text = self._strip_html(raw)
-                if text and len(text) > 10:
-                    posts.append({
-                        "id": f"html_{i}_{hash(text)}",
-                        "text": text,
-                        "url": f"https://truthsocial.com/@{self.username}",
-                        "date": "",
-                        "media": [],
-                    })
-            return posts
+                if link_el:
+                    href = link_el.get_attribute("href")
+                    if href:
+                        post_url = f"https://truthsocial.com{href}" if href.startswith("/") else href
+                        # Извлекаем ID из URL
+                        parts = href.rstrip("/").split("/")
+                        if parts and parts[-1].isdigit():
+                            post_id = parts[-1]
 
-        log.warning("HTML scrape: couldn't find posts in HTML (got %d bytes)", len(html))
-        return []
+                # Дата
+                time_el = el.query_selector("time")
+                date = ""
+                if time_el:
+                    date = time_el.get_attribute("datetime") or time_el.inner_text()
+                    if date:
+                        date = date[:10]
 
-    def _extract_from_next_data(self, data: dict, limit: int) -> list[dict]:
-        """Извлекает посты из __NEXT_DATA__ JSON."""
-        # Ищем массив постов в разных местах структуры
-        def find_statuses(obj, depth=0):
-            if depth > 10:
+                posts.append({
+                    "id": post_id,
+                    "text": raw_text,
+                    "url": post_url,
+                    "date": date,
+                    "element_index": i,  # индекс элемента на странице для скриншота
+                })
+
+            except Exception as e:
+                log.debug("Failed to extract post %d: %s", i, e)
+                continue
+
+        return posts
+
+    def screenshot_post(self, username: str, element_index: int) -> bytes | None:
+        """
+        Делает скриншот конкретного поста на странице профиля.
+        Возвращает PNG bytes или None.
+        """
+        page = self.new_page()
+        try:
+            url = f"https://truthsocial.com/@{username}"
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(3000)
+
+            # Ищем элементы постов
+            selectors = [
+                'article[data-testid="status"]',
+                'div.status-wrapper',
+                'article.status',
+                'div[class*="status"]',
+                'div[class*="post"]',
+                'article',
+            ]
+
+            elements = []
+            for sel in selectors:
+                elements = page.query_selector_all(sel)
+                if elements:
+                    break
+
+            if not elements or element_index >= len(elements):
+                log.warning("Cannot find post element at index %d (found %d)", element_index, len(elements))
                 return None
-            if isinstance(obj, list):
-                if obj and isinstance(obj[0], dict) and "content" in obj[0]:
-                    return obj
-                for item in obj:
-                    result = find_statuses(item, depth + 1)
-                    if result:
-                        return result
-            elif isinstance(obj, dict):
-                if "content" in obj and "account" in obj:
-                    return [obj]
-                for key in ["statuses", "posts", "items", "props", "pageProps", "data"]:
-                    if key in obj:
-                        result = find_statuses(obj[key], depth + 1)
-                        if result:
-                            return result
+
+            el = elements[element_index]
+
+            # Скроллим к элементу
+            el.scroll_into_view_if_needed()
+            page.wait_for_timeout(500)
+
+            # Делаем скриншот элемента
+            screenshot = el.screenshot(type="png")
+            log.info("Screenshot taken: %d bytes", len(screenshot))
+            return screenshot
+
+        except Exception as e:
+            log.error("Screenshot failed: %s", e)
             return None
-
-        statuses = find_statuses(data)
-        if statuses:
-            return self._extract_statuses(statuses, limit)
-        return []
-
-    def _extract_statuses(self, items: list, limit: int) -> list[dict]:
-        """Конвертирует массив Mastodon-совместимых статусов в наш формат."""
-        posts = []
-        for item in items[:limit]:
-            text = self._strip_html(item.get("content", ""))
-            if not text:
-                continue
-            posts.append({
-                "id": str(item.get("id", hash(text))),
-                "text": text,
-                "url": item.get("url", ""),
-                "date": item.get("created_at", "")[:10],
-                "media": [m.get("type", "unknown") for m in item.get("media_attachments", [])],
-            })
-        return posts
-
-    def _fetch_rsshub(self, limit: int) -> list[dict]:
-        """Метод 3: RSSHub."""
-        urls = [
-            f"https://rsshub.app/truthsocial/user/{self.username}",
-            f"https://rsshub.rssforever.com/truthsocial/user/{self.username}",
-            f"https://rss.fatpandac.com/truthsocial/user/{self.username}",
-        ]
-
-        for url in urls:
-            try:
-                resp = self._session.get(url, timeout=20)
-                log.info("RSSHub %s → %d, content-type: %s, preview: %s",
-                         url, resp.status_code,
-                         resp.headers.get("Content-Type", "?"),
-                         resp.text[:100])
-                if resp.status_code == 200 and ("<?xml" in resp.text[:100] or "<rss" in resp.text[:200]):
-                    return self._parse_rss(resp.text, limit)
-            except Exception as e:
-                log.debug("RSSHub %s error: %s", url, e)
-                continue
-
-        raise Exception("RSSHub: no working instance")
-
-    def _fetch_nitter(self, limit: int) -> list[dict]:
-        """Метод 4: Nitter зеркала."""
-        urls = [
-            f"https://nitter.poast.org/{self.username}/rss",
-            f"https://nitter.privacydev.net/{self.username}/rss",
-            f"https://nitter.woodland.cafe/{self.username}/rss",
-        ]
-
-        for url in urls:
-            try:
-                resp = self._session.get(url, timeout=20)
-                log.info("Nitter %s → %d, preview: %s",
-                         url, resp.status_code, resp.text[:100])
-                if resp.status_code == 200 and ("<?xml" in resp.text[:100] or "<rss" in resp.text[:200]):
-                    return self._parse_rss(resp.text, limit)
-            except Exception as e:
-                log.debug("Nitter %s error: %s", url, e)
-                continue
-
-        raise Exception("Nitter: no working instance")
-
-    def _parse_rss(self, xml_text: str, limit: int) -> list[dict]:
-        """Парсит RSS XML в список постов."""
-        root = ET.fromstring(xml_text)
-        items = root.findall(".//item")[:limit]
-
-        posts = []
-        for item in items:
-            title = item.findtext("title", "").strip()
-            link = item.findtext("link", "").strip()
-            description = item.findtext("description", "").strip()
-            pub_date = item.findtext("pubDate", "").strip()
-
-            text = self._strip_html(description) if description else title
-            if not text:
-                continue
-
-            post_id = link.rstrip("/").split("/")[-1] if link else str(hash(text))
-
-            posts.append({
-                "id": post_id,
-                "text": text,
-                "url": link,
-                "date": pub_date[:16] if pub_date else "",
-                "media": [],
-            })
-
-        return posts
-
-    @staticmethod
-    def _strip_html(html: str) -> str:
-        """Убирает HTML-теги и декодирует entities."""
-        text = re.sub(r"<[^>]+>", "", html)
-        text = re.sub(r"&amp;", "&", text)
-        text = re.sub(r"&lt;", "<", text)
-        text = re.sub(r"&gt;", ">", text)
-        text = re.sub(r"&#39;", "'", text)
-        text = re.sub(r"&quot;", '"', text)
-        text = re.sub(r"&nbsp;", " ", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip()
+        finally:
+            page.close()
 
 # ─── Translation ───────────────────────────────────────────────────────────────
 
@@ -424,40 +330,29 @@ def analyze_sentiment(text: str) -> tuple[str, str]:
     else:
         return "⚪", "нейтральный"
 
-# ─── Message Formatting ────────────────────────────────────────────────────────
-
-def format_post(post: dict) -> str | None:
-    text = post["text"]
-    if not text or len(text) < 5:
-        return None
-
-    url = post.get("url", "")
-    date = post.get("date", "")
-    media = post.get("media", [])
-
-    translated = translate_to_russian(text)
-    emoji, label = analyze_sentiment(text)
-
-    media_note = ""
-    if media:
-        media_note = f"\n📎 <i>Вложений: {len(media)} ({', '.join(media)})</i>"
-
-    msg = f"""<b>🔴 Новый пост Truth Social</b>
-📅 {date} | {emoji} Тон: <b>{label}</b>
-
-<b>🇺🇸 Оригинал:</b>
-{text}
-
-<b>🇷🇺 Перевод:</b>
-{translated}
-{media_note}
-🔗 <a href="{url}">Открыть в Truth Social</a>""".strip()
-
-    return msg
-
 # ─── Telegram Sender ───────────────────────────────────────────────────────────
 
-def send_to_telegram(text: str):
+def send_photo_to_telegram(photo_bytes: bytes, caption: str):
+    """Отправляет фото с подписью в Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    if TELEGRAM_THREAD_ID:
+        data["message_thread_id"] = int(TELEGRAM_THREAD_ID)
+
+    files = {
+        "photo": ("post.png", photo_bytes, "image/png"),
+    }
+    resp = requests.post(url, data=data, files=files, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_text_to_telegram(text: str):
+    """Отправляет текстовое сообщение в Telegram (fallback если скриншот не удался)."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -473,38 +368,71 @@ def send_to_telegram(text: str):
 
 # ─── Main Poll Logic ───────────────────────────────────────────────────────────
 
-fetcher = TruthSocialFetcher(TRUTHSOCIAL_USERNAME)
+browser = Browser()
 
 
 def poll_once():
     try:
         log.info("Polling @%s ...", TRUTHSOCIAL_USERNAME)
 
-        posts = fetcher.fetch(limit=10)
+        posts = browser.fetch_posts(TRUTHSOCIAL_USERNAME, limit=10)
 
         if not posts:
-            log.info("No posts returned.")
+            log.info("No posts found.")
             return
 
+        # Сортируем от старых к новым
         posts_sorted = list(reversed(posts))
         new_count = 0
 
         for post in posts_sorted:
             post_id = post["id"]
+
             if is_sent(post_id):
                 continue
 
-            message = format_post(post)
-            if message is None:
-                log.info("Skipping post %s (too short)", post_id)
+            text = post["text"]
+            if len(text) < 10:
                 mark_sent(post_id)
                 continue
 
+            # Sentiment
+            emoji, label = analyze_sentiment(text)
+
+            # Перевод
+            translated = translate_to_russian(text)
+
+            # Подпись к скриншоту
+            caption = (
+                f"<b>🔴 Пост из Truth Social</b>\n"
+                f"📅 {post.get('date', '')} | {emoji} Тон: <b>{label}</b>\n\n"
+                f"<b>🇷🇺 Перевод:</b>\n"
+                f"{translated}\n\n"
+                f"🔗 <a href=\"{post.get('url', '')}\">Открыть оригинал</a>"
+            )
+
+            # Делаем скриншот
+            screenshot = browser.screenshot_post(TRUTHSOCIAL_USERNAME, post.get("element_index", 0))
+
             try:
-                send_to_telegram(message)
+                if screenshot:
+                    send_photo_to_telegram(screenshot, caption)
+                    log.info("✅ Sent screenshot + translation for post %s", post_id)
+                else:
+                    # Fallback: отправляем текстом
+                    fallback = (
+                        f"<b>🔴 Пост из Truth Social</b>\n"
+                        f"📅 {post.get('date', '')} | {emoji} Тон: <b>{label}</b>\n\n"
+                        f"<b>🇺🇸 Оригинал:</b>\n{text}\n\n"
+                        f"<b>🇷🇺 Перевод:</b>\n{translated}\n\n"
+                        f"🔗 <a href=\"{post.get('url', '')}\">Открыть оригинал</a>"
+                    )
+                    send_text_to_telegram(fallback)
+                    log.info("⚠️ Sent text (screenshot failed) for post %s", post_id)
+
                 mark_sent(post_id)
                 new_count += 1
-                log.info("✅ Sent post %s to Telegram", post_id)
+
             except Exception as e:
                 log.error("Failed to send post %s: %s", post_id, e)
 
@@ -525,11 +453,12 @@ def startup_check():
         raise SystemExit("❌ TELEGRAM_CHAT_ID не задан!")
 
     init_db()
+    browser.start()
 
     if get_last_id() is None:
         log.info("First run — fetching current posts to avoid spam...")
         try:
-            posts = fetcher.fetch(limit=5)
+            posts = browser.fetch_posts(TRUTHSOCIAL_USERNAME, limit=5)
             for post in posts:
                 mark_sent(post["id"])
             if posts:
@@ -561,6 +490,8 @@ def main():
     except (KeyboardInterrupt, SystemExit):
         log.info("Shutting down...")
         scheduler.shutdown()
+    finally:
+        browser.stop()
 
 
 if __name__ == "__main__":
