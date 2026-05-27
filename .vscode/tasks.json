@@ -1,0 +1,21 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Git Push",
+            "type": "shell",
+            "command": "git add . && git commit -m 'v3: API interception via Playwright' && git push origin main",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "none",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        }
+    ]
+}
