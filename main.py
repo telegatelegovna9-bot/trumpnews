@@ -34,6 +34,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")
 TRUTHSOCIAL_USERNAME = os.getenv("TRUTHSOCIAL_USERNAME", "realDonaldTrump")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_MINUTES", "5"))
+SEND_ON_FIRST_RUN = os.getenv("SEND_ON_FIRST_RUN", "false").lower() in ("true", "1", "yes")
 
 DB_PATH = Path(__file__).parent / "state.db"
 
@@ -726,8 +727,36 @@ def main():
                 posts = fetch_posts_via_api(TRUTHSOCIAL_USERNAME, limit=5)
             if not posts:
                 posts = fetch_posts_via_playwright(browser, limit=5)
-            for p in posts:
-                mark_sent(p["id"])
+
+            if SEND_ON_FIRST_RUN and posts:
+                log.info("SEND_ON_FIRST_RUN=true — отправляем %d постов в Telegram", len(posts))
+                for p in reversed(posts):
+                    post_id = p["id"]
+                    text = p["text"]
+                    if len(text) < 10:
+                        mark_sent(post_id)
+                        continue
+                    emoji, label = analyze_sentiment(text)
+                    translated = translate_to_russian(text)
+                    url = p.get("url", "")
+                    date = p.get("date", "")
+                    try:
+                        msg = (
+                            f"<b>🔴 Пост из Truth Social</b>\n"
+                            f"📅 {date} | {emoji} Тон: <b>{label}</b>\n\n"
+                            f"<b>🇺🇸 Оригинал:</b>\n{text}\n\n"
+                            f"<b>🇷🇺 Перевод:</b>\n{translated}\n\n"
+                            f'🔗 <a href="{url}">Открыть оригинал</a>'
+                        )
+                        send_text(msg)
+                        mark_sent(post_id)
+                        log.info("✅ Sent post %s", post_id)
+                    except Exception as e:
+                        log.error("Send failed %s: %s", post_id, e)
+            else:
+                for p in posts:
+                    mark_sent(p["id"])
+
             if posts:
                 set_last_id(posts[0]["id"])
                 log.info("Marked %d existing posts.", len(posts))
