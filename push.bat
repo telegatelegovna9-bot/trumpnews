@@ -1,7 +1,7 @@
 @echo off
 cd /d "C:\Users\fames_rd\Desktop\trump mode"
 git add .
-git commit -m "Fix: filter API to main feed only + screenshot by URL"
+git commit -m "Debug: log all API calls to find correct filter"
 git push origin main
 echo.
 echo DONE!

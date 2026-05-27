@@ -150,19 +150,22 @@ def fetch_posts_via_playwright(pw_browser, limit: int = 10) -> list[dict]:
 
     def handle_response(response):
         url = response.url
-        # Только основная лента (exclude_replies=true), не pinned и не media-only
-        if "/api/v1/accounts/" in url and "/statuses" in url and "exclude_replies=true" in url:
-            try:
-                data = response.json()
-                if isinstance(data, list):
-                    for item in data:
-                        post_id = str(item.get("id", ""))
-                        if post_id and post_id not in seen_ids:
-                            seen_ids.add(post_id)
-                            api_posts.append(item)
-                    log.info("Intercepted API: %d statuses (total unique: %d)", len(data), len(api_posts))
-            except Exception:
-                pass
+        # Логируем все API-запросы к statuses для дебага
+        if "/api/v1/accounts/" in url and "/statuses" in url:
+            log.info("API call: %s", url.split("?")[1] if "?" in url else "no params")
+            # Берём основную ленту (не pinned, не media-only)
+            if "pinned=true" not in url and "only_media=true" not in url:
+                try:
+                    data = response.json()
+                    if isinstance(data, list):
+                        for item in data:
+                            post_id = str(item.get("id", ""))
+                            if post_id and post_id not in seen_ids:
+                                seen_ids.add(post_id)
+                                api_posts.append(item)
+                        log.info("Accepted %d statuses (total unique: %d)", len(data), len(api_posts))
+                except Exception:
+                    pass
 
     page.on("response", handle_response)
 
