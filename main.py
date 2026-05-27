@@ -20,6 +20,13 @@ try:
     HAS_CURL_CFFI = True
 except ImportError:
     HAS_CURL_CFFI = False
+
+try:
+    import cloudscraper
+    HAS_CLOUDSCRAPER = True
+except ImportError:
+    HAS_CLOUDSCRAPER = False
+
 from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
@@ -590,10 +597,30 @@ def get_account_id(username: str) -> str | None:
         return _cached_account_id
 
     url = f"https://truthsocial.com/api/v1/accounts/lookup?acct={username}"
-    try:
-        log.info("API lookup: %s (proxy=%s)", url, PROXY_ENABLED)
-        proxy_dict = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_ENABLED and PROXY_URL else None
+    proxy_dict = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_ENABLED and PROXY_URL else None
 
+    # Пробуем cloudscraper (обходит Cloudflare)
+    if HAS_CLOUDSCRAPER:
+        try:
+            log.info("API lookup via cloudscraper: %s", url)
+            scraper = cloudscraper.create_scraper()
+            r = scraper.get(url, timeout=15)
+            log.info("API lookup status: %d", r.status_code)
+            if r.status_code == 200:
+                data = r.json()
+                account_id = str(data.get("id", ""))
+                if account_id:
+                    _cached_account_id = account_id
+                    log.info("✅ Account ID: %s", account_id)
+                    return account_id
+            else:
+                log.warning("API lookup failed: %d — %s", r.status_code, r.text[:300])
+        except Exception as e:
+            log.warning("API lookup error: %s", e)
+
+    # Fallback на curl_cffi / requests
+    try:
+        log.info("API lookup via curl_cffi: %s (proxy=%s)", url, PROXY_ENABLED)
         if HAS_CURL_CFFI:
             r = curl_requests.get(url, timeout=15, impersonate="chrome", proxies=proxy_dict)
         else:
@@ -625,10 +652,42 @@ def fetch_posts_via_api(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10) -
 
     url = f"https://truthsocial.com/api/v1/accounts/{account_id}/statuses"
     params = {"limit": limit}
-    try:
-        log.info("API fetch: %s?limit=%d (proxy=%s)", url, limit, PROXY_ENABLED)
-        proxy_dict = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_ENABLED and PROXY_URL else None
+    proxy_dict = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_ENABLED and PROXY_URL else None
 
+    # Пробуем cloudscraper (обходит Cloudflare)
+    if HAS_CLOUDSCRAPER:
+        try:
+            log.info("API fetch via cloudscraper: %s?limit=%d", url, limit)
+            scraper = cloudscraper.create_scraper()
+            r = scraper.get(url, params=params, timeout=15)
+            log.info("API fetch status: %d", r.status_code)
+
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    posts = []
+                    for item in data:
+                        post_id = str(item.get("id", ""))
+                        text = strip_html(item.get("content", ""))
+                        if not text or len(text) < 10:
+                            continue
+                        posts.append({
+                            "id": post_id,
+                            "text": text,
+                            "url": item.get("url", ""),
+                            "date": item.get("created_at", "")[:10],
+                            "media": [m.get("type", "") for m in item.get("media_attachments", [])],
+                        })
+                    log.info("✅ API: got %d posts", len(posts))
+                    return posts
+            else:
+                log.warning("API fetch failed: %d — %s", r.status_code, r.text[:300])
+        except Exception as e:
+            log.error("API fetch error: %s", e)
+
+    # Fallback на curl_cffi / requests
+    try:
+        log.info("API fetch via curl_cffi: %s?limit=%d (proxy=%s)", url, limit, PROXY_ENABLED)
         if HAS_CURL_CFFI:
             r = curl_requests.get(url, params=params, timeout=15, impersonate="chrome", proxies=proxy_dict)
         else:
