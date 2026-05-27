@@ -1033,6 +1033,66 @@ def fetch_posts_via_rsshub(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10
         return []
 
 
+def fetch_posts_via_google_news(limit: int = 5) -> list[dict]:
+    """Мониторинг через Google News RSS — не блокируется Cloudflare."""
+    url = "https://news.google.com/rss/search?q=trump+truth+social&hl=en-US&gl=US&ceid=US:en"
+    try:
+        log.info("Google News fetch: %s", url)
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        log.info("Google News status: %d", r.status_code)
+
+        if r.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        items = soup.find_all("item")
+        log.info("Google News: found %d items", len(items))
+
+        posts = []
+        for item in items[:limit]:
+            title = item.find("title")
+            link = item.find("link")
+            pub_date = item.find("pubdate")
+
+            if not title:
+                continue
+
+            text = title.get_text(strip=True)
+            if len(text) < 15:
+                continue
+
+            # Проверяем что это про Truth Social / Trump пост
+            text_lower = text.lower()
+            if not any(kw in text_lower for kw in ["truth social", "trump post", "trump truth", "trump says", "trump writes"]):
+                continue
+
+            post_url = ""
+            if link:
+                post_url = link.string.strip() if link.string else link.get_text(strip=True)
+
+            date_str = ""
+            if pub_date and pub_date.string:
+                date_str = pub_date.string[:16]
+
+            post_id = str(hash(text))[:16]
+
+            posts.append({
+                "id": post_id,
+                "text": text,
+                "url": post_url,
+                "date": date_str,
+                "media": [],
+                "source": "google_news",
+            })
+
+        log.info("✅ Google News: got %d relevant posts", len(posts))
+        return posts
+
+    except Exception as e:
+        log.error("Google News error: %s", e)
+        return []
+
+
 def take_screenshot(pw_browser, post_url: str) -> bytes | None:
     """Делает скриншот карточки поста (обрезка точно под пост)."""
     if not post_url:
@@ -1154,14 +1214,19 @@ def poll_once(pw_browser):
     # Метод 1: RSSHub (быстрый, обходит Cloudflare)
     posts = fetch_posts_via_rsshub(TRUTHSOCIAL_USERNAME, limit=10)
 
-    # Метод 2: Прямой API-запрос (curl_cffi)
+    # Метод 2: Прямой API-запрос (curl_cffi + cloudscraper)
     if not posts:
         log.info("RSSHub вернул 0 постов, пробуем API...")
         posts = fetch_posts_via_api(TRUTHSOCIAL_USERNAME, limit=10)
 
-    # Метод 3: Playwright (fallback)
+    # Метод 3: Google News RSS (не блокируется)
     if not posts:
-        log.info("API вернул 0 постов, пробуем Playwright...")
+        log.info("API вернул 0 постов, пробуем Google News...")
+        posts = fetch_posts_via_google_news(limit=5)
+
+    # Метод 4: Playwright (fallback)
+    if not posts:
+        log.info("Google News вернул 0 постов, пробуем Playwright...")
         posts = fetch_posts_via_playwright(pw_browser, limit=10)
 
     if not posts:
