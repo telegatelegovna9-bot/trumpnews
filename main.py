@@ -5,7 +5,6 @@ Truth Social → Telegram Bot v3
 
 import os
 import re
-import json
 import logging
 import sqlite3
 import time
@@ -145,17 +144,23 @@ def fetch_posts_via_playwright(pw_browser, limit: int = 10) -> list[dict]:
     )
     page = context.new_page()
 
-    # Перехватываем API-ответы с постами
+    # Перехватываем API-ответы с постами (только основную ленту)
     api_posts = []
+    seen_ids = set()
 
     def handle_response(response):
         url = response.url
-        if "/api/v1/accounts/" in url and "/statuses" in url:
+        # Только основная лента (exclude_replies=true), не pinned и не media-only
+        if "/api/v1/accounts/" in url and "/statuses" in url and "exclude_replies=true" in url:
             try:
                 data = response.json()
                 if isinstance(data, list):
-                    api_posts.extend(data)
-                    log.info("Intercepted API: %d statuses from %s", len(data), url)
+                    for item in data:
+                        post_id = str(item.get("id", ""))
+                        if post_id and post_id not in seen_ids:
+                            seen_ids.add(post_id)
+                            api_posts.append(item)
+                    log.info("Intercepted API: %d statuses (total unique: %d)", len(data), len(api_posts))
             except Exception:
                 pass
 
@@ -189,36 +194,11 @@ def fetch_posts_via_playwright(pw_browser, limit: int = 10) -> list[dict]:
         log.info("No API intercepted, trying DOM scraping...")
         posts = scrape_dom(page, limit)
 
-        # Метод 3: Скриншот всей страницы для дебага
-        if not posts:
-            log.warning("No posts found! Saving debug info...")
-            page.screenshot(path="/app/debug_page.png", full_page=True)
-            html = page.content()
-            with open("/app/debug_page.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            log.info("Saved debug_page.html (%d chars) and debug_page.png", len(html))
-
-            # Попробуем извлечь ВСЕ текстовые блоки длиннее 50 символов
-            all_texts = page.evaluate("""() => {
-                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                const texts = [];
-                while (walker.nextNode()) {
-                    const t = walker.currentNode.textContent.trim();
-                    if (t.length > 50 && t.length < 2000) texts.push(t.substring(0, 100));
-                }
-                return texts;
-            }""")
-            log.info("All text blocks > 50 chars: %s", json.dumps(all_texts[:20], ensure_ascii=False))
-
         context.close()
         return posts
 
     except Exception as e:
         log.error("fetch_posts failed: %s", e)
-        try:
-            page.screenshot(path="/app/debug_error.png")
-        except Exception:
-            pass
         context.close()
         return []
 
@@ -295,8 +275,11 @@ def strip_html(html: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def take_screenshot(pw_browser, element_index: int = 0) -> bytes | None:
-    """Делает скриншот поста."""
+def take_screenshot(pw_browser, post_url: str) -> bytes | None:
+    """Делает скриншот поста по его URL."""
+    if not post_url:
+        return None
+
     context = pw_browser.new_context(
         viewport={"width": 1280, "height": 900},
         locale="en-US",
@@ -304,21 +287,33 @@ def take_screenshot(pw_browser, element_index: int = 0) -> bytes | None:
     )
     page = context.new_page()
     try:
-        page.goto(f"https://truthsocial.com/@{TRUTHSOCIAL_USERNAME}", wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(8000)
+        log.info("Screenshot: loading %s", post_url)
+        page.goto(post_url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(5000)
 
-        selectors = ['article[data-testid="status"]', 'article.status', 'article', 'div[class*="status"]']
+        # Ищем пост на странице
+        selectors = [
+            'article[data-testid="status"]',
+            'article.status',
+            'div[class*="status"]',
+            'article',
+        ]
+
         elements = []
         for sel in selectors:
             elements = page.query_selector_all(sel)
             if elements:
                 break
 
-        if not elements or element_index >= len(elements):
+        if not elements:
+            log.warning("Screenshot: no elements found on %s", post_url)
+            # Скриншот всей страницы как fallback
+            screenshot = page.screenshot(type="png")
             context.close()
-            return None
+            return screenshot
 
-        el = elements[element_index]
+        # Берём первый (основной) элемент — на странице поста он один
+        el = elements[0]
         el.scroll_into_view_if_needed()
         page.wait_for_timeout(500)
         screenshot = el.screenshot(type="png")
@@ -361,8 +356,8 @@ def poll_once(pw_browser):
 
         # Пробуем скриншот
         screenshot = None
-        if "element_index" in post:
-            screenshot = take_screenshot(pw_browser, post["element_index"])
+        if url:
+            screenshot = take_screenshot(pw_browser, url)
 
         try:
             if screenshot:
