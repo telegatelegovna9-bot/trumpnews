@@ -14,6 +14,11 @@ from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
 from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
@@ -413,10 +418,13 @@ def get_account_id(username: str) -> str | None:
     url = f"https://truthsocial.com/api/v1/accounts/lookup?acct={username}"
     try:
         log.info("API lookup: %s", url)
-        r = requests.get(url, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-        })
+        if HAS_CURL_CFFI:
+            r = curl_requests.get(url, timeout=15, impersonate="chrome")
+        else:
+            r = requests.get(url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            })
         log.info("API lookup status: %d", r.status_code)
         if r.status_code == 200:
             data = r.json()
@@ -443,10 +451,13 @@ def fetch_posts_via_api(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10) -
     params = {"limit": limit}
     try:
         log.info("API fetch: %s?limit=%d", url, limit)
-        r = requests.get(url, params=params, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-        })
+        if HAS_CURL_CFFI:
+            r = curl_requests.get(url, params=params, timeout=15, impersonate="chrome")
+        else:
+            r = requests.get(url, params=params, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            })
         log.info("API fetch status: %d", r.status_code)
 
         if r.status_code != 200:
@@ -630,7 +641,7 @@ def main():
     log.info("Starting Playwright...")
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-    log.info("✅ Browser ready.")
+    log.info("✅ Browser ready. curl_cffi=%s", HAS_CURL_CFFI)
 
     # First run
     if get_last_id() is None:

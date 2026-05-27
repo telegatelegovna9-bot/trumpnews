@@ -1,4 +1,5 @@
 requests==2.32.3
+curl_cffi>=0.7.0
 deep-translator==1.11.4
 textblob==0.18.0
 python-dotenv==1.1.0
