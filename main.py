@@ -42,10 +42,6 @@ SEND_ON_FIRST_RUN = os.getenv("SEND_ON_FIRST_RUN", "true").lower() in ("true", "
 # Proxy config
 PROXY_ENABLED = os.getenv("PROXY_ENABLED", "false").lower() in ("true", "1", "yes")
 PROXY_URL = os.getenv("PROXY_URL", "")
-if PROXY_ENABLED and PROXY_URL:
-    log.info("Proxy: ENABLED %s", PROXY_URL.split("@")[-1] if "@" in PROXY_URL else PROXY_URL)
-else:
-    log.info("Proxy: DISABLED")
 
 DB_PATH = Path(__file__).parent / "state.db"
 
@@ -55,6 +51,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("truth2tg")
 log.info("Config: SEND_ON_FIRST_RUN=%s", SEND_ON_FIRST_RUN)
+
+if PROXY_ENABLED and PROXY_URL:
+    log.info("Proxy: ENABLED %s", PROXY_URL.split("@")[-1] if "@" in PROXY_URL else PROXY_URL)
+else:
+    log.info("Proxy: DISABLED")
 
 # ─── Database ──────────────────────────────────────────────────────────────────
 
