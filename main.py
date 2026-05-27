@@ -168,21 +168,112 @@ def start_health_server():
     log.info("Health server on port %d", port)
     server.serve_forever()
 
-# ─── Core: Fetch posts via Playwright API interception ─────────────────────────
+# ─── Core: Stealth & Anti-Detection ───────────────────────────────────────────
 
 STEALTH_JS = """
-// Stealth: скрываем headless-фингерпринты
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-window.chrome = {runtime: {}};
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications'
-        ? Promise.resolve({state: Notification.permission})
-        : originalQuery(parameters)
-);
+// Comprehensive stealth: имитация реального Chrome
+(() => {
+    // 1. navigator.webdriver → undefined
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+    // 2. navigator.plugins — реалистичный массив
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+            const plugins = [
+                {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+                {name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: ''},
+                {name: 'Native Client', filename: 'internal-nacl-plugin', description: ''},
+            ];
+            plugins.length = 3;
+            return plugins;
+        }
+    });
+
+    // 3. navigator.languages
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+
+    // 4. window.chrome
+    window.chrome = {
+        runtime: {
+            onConnect: {addListener: function(){}},
+            onMessage: {addListener: function(){}},
+        },
+        loadTimes: function(){return {}},
+        csi: function(){return {}},
+    };
+
+    // 5. permissions.query
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : originalQuery(parameters)
+    );
+
+    // 6. WebGL vendor/renderer
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        if (parameter === 37445) return 'Google Inc. (Intel)';
+        if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630, OpenGL 4.5)';
+        return getParameter.call(this, parameter);
+    };
+
+    // 7. navigator.hardwareConcurrency
+    Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+
+    // 8. navigator.deviceMemory
+    Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+
+    // 9. screen dimensions (реалистичные)
+    Object.defineProperty(screen, 'width', {get: () => 1920});
+    Object.defineProperty(screen, 'height', {get: () => 1080});
+    Object.defineProperty(screen, 'availWidth', {get: () => 1920});
+    Object.defineProperty(screen, 'availHeight', {get: () => 1040});
+
+    // 10. navigator.platform
+    Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+
+    // 11. Отключаем Automation флаг
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+})();
 """
+
+# User-Agent ротация
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.118 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.118 Safari/537.36",
+]
+
+# Cookies persistence
+COOKIES_PATH = Path(__file__).parent / "cookies.json"
+
+def save_cookies(cookies: list):
+    try:
+        COOKIES_PATH.write_text(json.dumps(cookies, indent=2))
+        log.info("Saved %d cookies", len(cookies))
+    except Exception as e:
+        log.warning("Save cookies failed: %s", e)
+
+def load_cookies() -> list:
+    try:
+        if COOKIES_PATH.exists():
+            cookies = json.loads(COOKIES_PATH.read_text())
+            log.info("Loaded %d cookies from file", len(cookies))
+            return cookies
+    except Exception as e:
+        log.warning("Load cookies failed: %s", e)
+    return []
+
+# ─── Human-like delays ──────────────────────────────────────────────────────
+
+def human_delay(min_ms=500, max_ms=2000):
+    """Случайная задержка как у человека."""
+    time.sleep(random.randint(min_ms, max_ms) / 1000)
 
 
 def is_cloudflare_challenge(page) -> bool:
@@ -627,34 +718,44 @@ def get_cloudflare_cookies() -> list:
 
 
 def take_screenshot(pw_browser, post_url: str) -> bytes | None:
-    """Делает скриншот поста через Playwright с cookies от cloudscraper."""
+    """Делает скриншот поста через Playwright с cookies от cloudscraper + human-like."""
     if not post_url:
         return None
 
-    # Получаем cookies для обхода Cloudflare
     cookies = get_cloudflare_cookies()
+    ua = random.choice(USER_AGENTS)
 
     context = pw_browser.new_context(
-        viewport={"width": 1200, "height": 900},
+        viewport={"width": 1920, "height": 1080},
         locale="en-US",
         timezone_id="America/New_York",
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
-        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        user_agent=ua,
+        extra_http_headers={
+            "Accept-Language": "en-US,en;q=0.9",
+            "sec-ch-ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        },
     )
 
-    # Добавляем cookies от cloudscraper
     if cookies:
         context.add_cookies(cookies)
-        log.info("Injected %d cookies into browser", len(cookies))
+        log.info("Injected %d cookies, UA: %s...", len(cookies), ua[:40])
 
     page = context.new_page()
+    page.add_init_script(STEALTH_JS)
 
     try:
+        # Human-like: небольшая задержка перед загрузкой
+        human_delay(300, 1500)
+
         log.info("Screenshot: loading %s", post_url)
         page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(3000)
 
-        # Проверяем что не Cloudflare challenge
+        # Human-like: ждём как человек
+        human_delay(2000, 4000)
+
+        # Проверяем Cloudflare
         body_text = page.inner_text("body", timeout=3000)
         if "security verification" in body_text.lower() or "just a moment" in body_text.lower():
             log.warning("Screenshot: Cloudflare challenge, retrying with fresh cookies...")
@@ -664,13 +765,20 @@ def take_screenshot(pw_browser, post_url: str) -> bytes | None:
             if cookies:
                 context.clear_cookies()
                 context.add_cookies(cookies)
+                human_delay(1000, 3000)
                 page.reload(wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(3000)
+                human_delay(2000, 4000)
                 body_text = page.inner_text("body", timeout=3000)
                 if "security verification" in body_text.lower():
-                    log.warning("Screenshot: still blocked after cookie refresh")
+                    log.warning("Screenshot: still blocked")
                     context.close()
                     return None
+
+        # Human-like: скроллим немного вниз
+        page.mouse.move(500, 400)
+        human_delay(200, 500)
+        page.mouse.wheel(0, 200)
+        human_delay(300, 800)
 
         # Ищем карточку поста
         selectors = [
