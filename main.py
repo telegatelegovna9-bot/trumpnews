@@ -24,6 +24,8 @@ from deep_translator import GoogleTranslator
 from textblob import TextBlob
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -407,6 +409,95 @@ def strip_html(html: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def generate_post_image(text: str, date: str = "", sentiment_label: str = "") -> bytes | None:
+    """Генерирует картинку-карточку поста из текста."""
+    try:
+        # Настройки
+        width = 800
+        padding = 40
+        bg_color = (22, 22, 22)  # Тёмный фон
+        text_color = (255, 255, 255)
+        accent_color = (29, 155, 240)  # Синий акцент
+        header_color = (255, 69, 0)  # Красный для заголовка
+
+        # Шрифт (попробуем несколько путей)
+        font_path = None
+        possible_fonts = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+        for fp in possible_fonts:
+            if Path(fp).exists():
+                font_path = fp
+                break
+
+        if font_path:
+            font_header = ImageFont.truetype(font_path, 22)
+            font_body = ImageFont.truetype(font_path, 18)
+            font_small = ImageFont.truetype(font_path, 14)
+        else:
+            font_header = ImageFont.load_default()
+            font_body = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+
+        # Обёртка текста
+        chars_per_line = 55
+        wrapped = textwrap.fill(text, width=chars_per_line)
+        lines = wrapped.split("\n")
+
+        # Высота картинки
+        line_height = 26
+        header_height = 60
+        footer_height = 40
+        total_height = padding + header_height + 10 + (len(lines) * line_height) + footer_height + padding
+
+        # Создаём картинку
+        img = Image.new("RGB", (width, total_height), bg_color)
+        draw = ImageDraw.Draw(img)
+
+        # Заголовок
+        y = padding
+        draw.text((padding, y), "🔴 Пост из Truth Social", fill=header_color, font=font_header)
+        y += 30
+
+        # Дата и тон
+        meta_parts = []
+        if date:
+            meta_parts.append(f"📅 {date}")
+        if sentiment_label:
+            meta_parts.append(f"🎭 {sentiment_label}")
+        if meta_parts:
+            draw.text((padding, y), " | ".join(meta_parts), fill=accent_color, font=font_small)
+        y += 25
+
+        # Разделитель
+        draw.line([(padding, y), (width - padding, y)], fill=(60, 60, 60), width=1)
+        y += 15
+
+        # Текст поста
+        for line in lines:
+            draw.text((padding, y), line, fill=text_color, font=font_body)
+            y += line_height
+
+        # Футер
+        y += 10
+        draw.line([(padding, y), (width - padding, y)], fill=(60, 60, 60), width=1)
+        y += 10
+        draw.text((padding, y), "Truth Social • @realDonaldTrump", fill=(120, 120, 120), font=font_small)
+
+        # Конвертим в bytes
+        from io import BytesIO
+        buf = BytesIO()
+        img.save(buf, format="PNG", quality=95)
+        return buf.getvalue()
+
+    except Exception as e:
+        log.error("Image generation failed: %s", e)
+        return None
+
+
 # ─── Direct Mastodon API ──────────────────────────────────────────────────────
 
 _cached_account_id: str | None = None
@@ -665,21 +756,19 @@ def poll_once(pw_browser):
         url = post.get("url", "")
         date = post.get("date", "")
 
-        # Пробуем скриншот
-        screenshot = None
-        if url:
-            screenshot = take_screenshot(pw_browser, url)
+        # Генерируем картинку из текста
+        img_bytes = generate_post_image(text, date, label)
 
         try:
-            if screenshot:
+            if img_bytes:
                 caption = (
                     f"<b>🔴 Пост из Truth Social</b>\n"
                     f"📅 {date} | {emoji} Тон: <b>{label}</b>\n\n"
                     f"<b>🇷🇺 Перевод:</b>\n{translated}\n\n"
                     f'🔗 <a href="{url}">Открыть оригинал</a>'
                 )
-                send_photo(screenshot, caption)
-                log.info("✅ Screenshot + translation sent for %s", post_id)
+                send_photo(img_bytes, caption)
+                log.info("✅ Image + translation sent for %s", post_id)
             else:
                 msg = (
                     f"<b>🔴 Пост из Truth Social</b>\n"
@@ -742,19 +831,19 @@ def main():
                     url = p.get("url", "")
                     date = p.get("date", "")
 
-                    # Пробуем скриншот
-                    screenshot = take_screenshot(browser, url) if url else None
+                    # Генерируем картинку
+                    img_bytes = generate_post_image(text, date, label)
 
                     try:
-                        if screenshot:
+                        if img_bytes:
                             caption = (
                                 f"<b>🔴 Пост из Truth Social</b>\n"
                                 f"📅 {date} | {emoji} Тон: <b>{label}</b>\n\n"
                                 f"<b>🇷🇺 Перевод:</b>\n{translated}\n\n"
                                 f'🔗 <a href="{url}">Открыть оригинал</a>'
                             )
-                            send_photo(screenshot, caption)
-                            log.info("✅ First run: screenshot sent for %s", post_id)
+                            send_photo(img_bytes, caption)
+                            log.info("✅ First run: image sent for %s", post_id)
                         else:
                             msg = (
                                 f"<b>🔴 Пост из Truth Social</b>\n"
