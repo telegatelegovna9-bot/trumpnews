@@ -176,9 +176,44 @@ def fetch_posts_via_playwright(pw_browser, limit: int = 10) -> list[dict]:
         page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(8000)
 
-        # Метод 1: Перехваченные API-данные
+        # Метод 2: API через браузер (обходит Cloudflare)
+        if not api_posts:
+            log.info("Trying in-browser API fetch...")
+            try:
+                lookup_data = page.evaluate("""
+                    async () => {
+                        const r = await fetch('/api/v1/accounts/lookup?acct=realDonaldTrump');
+                        if (!r.ok) return {error: r.status};
+                        return await r.json();
+                    }
+                """)
+                log.info("In-browser lookup: %s", str(lookup_data)[:200])
+
+                if lookup_data and lookup_data.get("id"):
+                    account_id = str(lookup_data["id"])
+                    statuses_data = page.evaluate("""
+                        async (accountId) => {
+                            const r = await fetch(`/api/v1/accounts/${accountId}/statuses?limit=10`);
+                            if (!r.ok) return {error: r.status};
+                            return await r.json();
+                        }
+                    """, account_id)
+                    log.info("In-browser statuses: got %s items", len(statuses_data) if isinstance(statuses_data, list) else "error")
+
+                    if isinstance(statuses_data, list):
+                        for item in statuses_data:
+                            post_id = str(item.get("id", ""))
+                            if post_id and post_id not in seen_ids:
+                                seen_ids.add(post_id)
+                                api_posts.append(item)
+                else:
+                    log.warning("In-browser lookup failed: %s", lookup_data)
+            except Exception as e:
+                log.warning("In-browser API error: %s", e)
+
+        # Метод 3: Playwright API interception (если SPA делает XHR)
         if api_posts:
-            log.info("Using %d posts from intercepted API", len(api_posts))
+            log.info("Using %d posts from API", len(api_posts))
             posts = []
             for item in api_posts[:limit]:
                 text = strip_html(item.get("content", ""))
@@ -194,8 +229,8 @@ def fetch_posts_via_playwright(pw_browser, limit: int = 10) -> list[dict]:
             context.close()
             return posts
 
-        # Метод 2: DOM-скрейпинг (fallback)
-        log.info("No API intercepted, trying DOM scraping...")
+        # Метод 4: DOM-скрейпинг (последний fallback)
+        log.info("No API data, trying DOM scraping...")
         posts = scrape_dom(page, limit)
 
         context.close()
@@ -233,15 +268,29 @@ def scrape_dom(page, limit: int) -> list[dict]:
         # Дебаг: дампим часть HTML чтобы понять структуру
         try:
             html = page.content()
-            # Ищем любые элементы с текстом от Trump
             soup = BeautifulSoup(html, "html.parser")
             articles = soup.find_all("article")
             divs_with_class = soup.find_all("div", class_=True)
             log.warning("DOM debug: page has %d <article>, %d <div> with classes", len(articles), len(divs_with_class))
-            if articles:
-                for i, art in enumerate(articles[:3]):
-                    log.warning("  article[%d] classes=%s text=%.200s", i, art.get("class", []), art.get_text(strip=True))
-            # Пишем HTML в файл для ручного анализа
+
+            # Показываем топ-10 div'ов с классами (по длине текста)
+            div_info = []
+            for d in divs_with_class:
+                txt = d.get_text(strip=True)
+                if len(txt) > 30:
+                    div_info.append((len(txt), d.get("class", []), txt[:120]))
+            div_info.sort(key=lambda x: -x[0])
+            for length, classes, txt in div_info[:10]:
+                log.warning("  div len=%d classes=%s text=%.120s", length, classes, txt)
+
+            # Ищем элементы с data-testid
+            testids = soup.find_all(attrs={"data-testid": True})
+            if testids:
+                log.warning("Found %d elements with data-testid:", len(testids))
+                for el in testids[:10]:
+                    log.warning("  data-testid=%s tag=%s text=%.100s", el.get("data-testid"), el.name, el.get_text(strip=True))
+
+            # Пишем HTML в файл
             dump_path = Path(__file__).parent / "debug_page.html"
             dump_path.write_text(html[:100000], encoding="utf-8")
             log.info("HTML dumped to %s (%d bytes)", dump_path, len(html))
