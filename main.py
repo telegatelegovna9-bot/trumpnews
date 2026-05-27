@@ -9,6 +9,7 @@ import logging
 import sqlite3
 import time
 import threading
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -37,6 +38,14 @@ TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")
 TRUTHSOCIAL_USERNAME = os.getenv("TRUTHSOCIAL_USERNAME", "realDonaldTrump")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_MINUTES", "15"))
 SEND_ON_FIRST_RUN = os.getenv("SEND_ON_FIRST_RUN", "true").lower() in ("true", "1", "yes")
+
+# Proxy config
+PROXY_ENABLED = os.getenv("PROXY_ENABLED", "false").lower() in ("true", "1", "yes")
+PROXY_URL = os.getenv("PROXY_URL", "")
+if PROXY_ENABLED and PROXY_URL:
+    log.info("Proxy: ENABLED %s", PROXY_URL.split("@")[-1] if "@" in PROXY_URL else PROXY_URL)
+else:
+    log.info("Proxy: DISABLED")
 
 DB_PATH = Path(__file__).parent / "state.db"
 
@@ -570,11 +579,13 @@ def get_account_id(username: str) -> str | None:
 
     url = f"https://truthsocial.com/api/v1/accounts/lookup?acct={username}"
     try:
-        log.info("API lookup: %s", url)
+        log.info("API lookup: %s (proxy=%s)", url, PROXY_ENABLED)
+        proxy_dict = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_ENABLED and PROXY_URL else None
+
         if HAS_CURL_CFFI:
-            r = curl_requests.get(url, timeout=15, impersonate="chrome")
+            r = curl_requests.get(url, timeout=15, impersonate="chrome", proxies=proxy_dict)
         else:
-            r = requests.get(url, timeout=15, headers={
+            r = requests.get(url, timeout=15, proxies=proxy_dict or {}, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                 "Accept": "application/json",
             })
@@ -603,11 +614,13 @@ def fetch_posts_via_api(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10) -
     url = f"https://truthsocial.com/api/v1/accounts/{account_id}/statuses"
     params = {"limit": limit}
     try:
-        log.info("API fetch: %s?limit=%d", url, limit)
+        log.info("API fetch: %s?limit=%d (proxy=%s)", url, limit, PROXY_ENABLED)
+        proxy_dict = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_ENABLED and PROXY_URL else None
+
         if HAS_CURL_CFFI:
-            r = curl_requests.get(url, params=params, timeout=15, impersonate="chrome")
+            r = curl_requests.get(url, params=params, timeout=15, impersonate="chrome", proxies=proxy_dict)
         else:
-            r = requests.get(url, params=params, timeout=15, headers={
+            r = requests.get(url, params=params, timeout=15, proxies=proxy_dict or {}, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                 "Accept": "application/json",
             })
@@ -648,8 +661,9 @@ def fetch_posts_via_rsshub(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10
     """Получает посты через RSSHub (обходит Cloudflare)."""
     url = f"https://rsshub.app/truthsocial/user/{username}"
     try:
-        log.info("RSSHub fetch: %s", url)
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        log.info("RSSHub fetch: %s (proxy=%s)", url, PROXY_ENABLED)
+        proxy_dict = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_ENABLED and PROXY_URL else None
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}, proxies=proxy_dict or {})
         log.info("RSSHub status: %d, len=%d", r.status_code, len(r.text))
 
         if r.status_code != 200:
@@ -915,8 +929,16 @@ def main():
     # Browser
     log.info("Starting Playwright...")
     pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-    log.info("✅ Browser ready. curl_cffi=%s", HAS_CURL_CFFI)
+    
+    # Proxy for Playwright
+    browser_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    launch_kwargs = {"headless": True, "args": browser_args}
+    if PROXY_ENABLED and PROXY_URL:
+        launch_kwargs["proxy"] = {"server": PROXY_URL}
+        log.info("Playwright proxy: %s", PROXY_URL.split("@")[-1] if "@" in PROXY_URL else PROXY_URL)
+    
+    browser = pw.chromium.launch(**launch_kwargs)
+    log.info("✅ Browser ready. curl_cffi=%s, proxy=%s", HAS_CURL_CFFI, PROXY_ENABLED)
 
     # First run
     if get_last_id() is None:
@@ -982,7 +1004,7 @@ def main():
         except Exception as e:
             log.warning("Startup failed: %s", e)
 
-    log.info("🚀 Bot started. Polling every %d min.", POLL_INTERVAL)
+    log.info("🚀 Bot started. Polling every %d min (±3 min jitter).", POLL_INTERVAL)
 
     backoff = 1
     max_backoff = 6  # 6 * 15 = 90 минут максимум
@@ -999,7 +1021,9 @@ def main():
                 log.error("Poll error: %s", e)
                 backoff = min(backoff + 1, max_backoff)
 
-            wait = POLL_INTERVAL * 60 * backoff
+            jitter = random.randint(-180, 180)  # ±3 минуты
+            wait = POLL_INTERVAL * 60 * backoff + jitter
+            wait = max(wait, 60)  # минимум 1 минута
             if backoff > 1:
                 log.info("Backoff x%d, waiting %d min", backoff, wait // 60)
             time.sleep(wait)
