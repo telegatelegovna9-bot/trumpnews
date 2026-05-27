@@ -185,12 +185,6 @@ def fetch_posts_via_playwright(pw_browser, limit: int = 10) -> list[dict]:
 
     # Применяем stealth-патчи ДО загрузки страницы
     page.add_init_script(STEALTH_JS)
-    if HAS_STEALTH:
-        try:
-            stealth_sync(page)
-            log.info("playwright-stealth applied")
-        except Exception as e:
-            log.warning("playwright-stealth failed: %s", e)
 
     # Перехватываем API-ответы с постами
     api_posts = []
@@ -502,11 +496,6 @@ def take_screenshot(pw_browser, post_url: str) -> bytes | None:
     )
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
-    if HAS_STEALTH:
-        try:
-            stealth_sync(page)
-        except Exception:
-            pass
 
     try:
         log.info("Screenshot: loading %s", post_url)
