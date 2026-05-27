@@ -35,7 +35,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID")
 TRUTHSOCIAL_USERNAME = os.getenv("TRUTHSOCIAL_USERNAME", "realDonaldTrump")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_MINUTES", "5"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_MINUTES", "15"))
 SEND_ON_FIRST_RUN = os.getenv("SEND_ON_FIRST_RUN", "true").lower() in ("true", "1", "yes")
 
 DB_PATH = Path(__file__).parent / "state.db"
@@ -811,6 +811,7 @@ def poll_once(pw_browser):
             log.error("Send failed %s: %s", post_id, e)
 
     log.info("Done. %d new post(s).", new_count)
+    return new_count
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
@@ -899,13 +900,25 @@ def main():
 
     log.info("🚀 Bot started. Polling every %d min.", POLL_INTERVAL)
 
+    backoff = 1
+    max_backoff = 6  # 6 * 15 = 90 минут максимум
+
     try:
         while True:
             try:
-                poll_once(browser)
+                posts = poll_once(browser)
+                if posts:
+                    backoff = 1  # Сброс backoff если посты получены
+                else:
+                    backoff = min(backoff + 1, max_backoff)
             except Exception as e:
                 log.error("Poll error: %s", e)
-            time.sleep(POLL_INTERVAL * 60)
+                backoff = min(backoff + 1, max_backoff)
+
+            wait = POLL_INTERVAL * 60 * backoff
+            if backoff > 1:
+                log.info("Backoff x%d, waiting %d min", backoff, wait // 60)
+            time.sleep(wait)
     except (KeyboardInterrupt, SystemExit):
         log.info("Shutting down...")
     finally:
