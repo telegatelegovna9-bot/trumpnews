@@ -586,6 +586,134 @@ def generate_post_image(text: str, date: str = "", sentiment_label: str = "") ->
         return None
 
 
+# ─── Screenshot with Cloudflare bypass ────────────────────────────────────────
+
+_cf_cookies: list | None = None
+
+def get_cloudflare_cookies() -> list:
+    """Получает cookies через cloudscraper для обхода Cloudflare."""
+    global _cf_cookies
+    if _cf_cookies is not None:
+        return _cf_cookies
+
+    if not HAS_CLOUDSCRAPER:
+        return []
+
+    try:
+        log.info("Getting Cloudflare cookies via cloudscraper...")
+        scraper = cloudscraper.create_scraper()
+        r = scraper.get("https://truthsocial.com/@realDonaldTrump", timeout=20)
+        log.info("cloudscraper status: %d", r.status_code)
+
+        if r.status_code == 200:
+            cookies = []
+            for name, value in scraper.cookies.items():
+                cookies.append({
+                    "name": name,
+                    "value": value,
+                    "domain": ".truthsocial.com",
+                    "path": "/",
+                })
+            _cf_cookies = cookies
+            log.info("✅ Got %d Cloudflare cookies", len(cookies))
+            return cookies
+        else:
+            log.warning("cloudscraper failed: %d", r.status_code)
+    except Exception as e:
+        log.warning("cloudscraper error: %s", e)
+
+    _cf_cookies = []
+    return []
+
+
+def take_screenshot(pw_browser, post_url: str) -> bytes | None:
+    """Делает скриншот поста через Playwright с cookies от cloudscraper."""
+    if not post_url:
+        return None
+
+    # Получаем cookies для обхода Cloudflare
+    cookies = get_cloudflare_cookies()
+
+    context = pw_browser.new_context(
+        viewport={"width": 1200, "height": 900},
+        locale="en-US",
+        timezone_id="America/New_York",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
+        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+    )
+
+    # Добавляем cookies от cloudscraper
+    if cookies:
+        context.add_cookies(cookies)
+        log.info("Injected %d cookies into browser", len(cookies))
+
+    page = context.new_page()
+
+    try:
+        log.info("Screenshot: loading %s", post_url)
+        page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(3000)
+
+        # Проверяем что не Cloudflare challenge
+        body_text = page.inner_text("body", timeout=3000)
+        if "security verification" in body_text.lower() or "just a moment" in body_text.lower():
+            log.warning("Screenshot: Cloudflare challenge, retrying with fresh cookies...")
+            global _cf_cookies
+            _cf_cookies = None
+            cookies = get_cloudflare_cookies()
+            if cookies:
+                context.clear_cookies()
+                context.add_cookies(cookies)
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
+                body_text = page.inner_text("body", timeout=3000)
+                if "security verification" in body_text.lower():
+                    log.warning("Screenshot: still blocked after cookie refresh")
+                    context.close()
+                    return None
+
+        # Ищем карточку поста
+        selectors = [
+            'div[data-testid="status"]',
+            'article[data-testid="status"]',
+            'div.status__wrapper',
+            'article.status',
+            'article',
+        ]
+
+        element = None
+        for sel in selectors:
+            els = page.query_selector_all(sel)
+            for el in els:
+                try:
+                    txt = el.inner_text()
+                    if len(txt) > 30:
+                        element = el
+                        log.info("Screenshot: found '%s' (text=%d chars)", sel, len(txt))
+                        break
+                except:
+                    pass
+            if element:
+                break
+
+        if element:
+            element.scroll_into_view_if_needed()
+            page.wait_for_timeout(300)
+            screenshot = element.screenshot(type="png", animations="disabled")
+            log.info("Screenshot: cropped to element, %d bytes", len(screenshot))
+            context.close()
+            return screenshot
+        else:
+            log.warning("Screenshot: no post element found")
+            context.close()
+            return None
+
+    except Exception as e:
+        log.error("Screenshot failed: %s", e)
+        context.close()
+        return None
+
+
 # ─── Direct Mastodon API ──────────────────────────────────────────────────────
 
 _cached_account_id: str | None = None
@@ -951,8 +1079,9 @@ def poll_once(pw_browser):
         url = post.get("url", "")
         date = post.get("date", "")
 
-        # Генерируем картинку поста
-        img_bytes = generate_post_image(text, date, label)
+        # Пробуем реальный скриншот, fallback на генерацию
+        screenshot = take_screenshot(pw_browser, url) if url else None
+        img_bytes = screenshot if screenshot else generate_post_image(text, date, label)
 
         try:
             if img_bytes:
@@ -1035,8 +1164,9 @@ def main():
                     url = p.get("url", "")
                     date = p.get("date", "")
 
-                    # Генерируем картинку поста
-                    img_bytes = generate_post_image(text, date, label)
+                    # Пробуем реальный скриншот, fallback на генерацию
+                    screenshot = take_screenshot(browser, url) if url else None
+                    img_bytes = screenshot if screenshot else generate_post_image(text, date, label)
 
                     try:
                         if img_bytes:
