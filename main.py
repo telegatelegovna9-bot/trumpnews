@@ -653,7 +653,7 @@ def fetch_posts_via_rsshub(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10
 
 
 def take_screenshot(pw_browser, post_url: str) -> bytes | None:
-    """Делает скриншот поста по его URL (через embed-страницу)."""
+    """Делает скриншот поста по его URL (обрезка под элемент поста)."""
     if not post_url:
         return None
 
@@ -665,7 +665,7 @@ def take_screenshot(pw_browser, post_url: str) -> bytes | None:
     embed_url = f"https://truthsocial.com/embed/statuses/{post_id}"
 
     context = pw_browser.new_context(
-        viewport={"width": 600, "height": 800},
+        viewport={"width": 1280, "height": 900},
         locale="en-US",
         timezone_id="America/New_York",
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
@@ -696,40 +696,47 @@ def take_screenshot(pw_browser, post_url: str) -> bytes | None:
             context.close()
             return None
 
-        # Ищем пост на странице
+        # Ищем пост на странице — более точные селекторы
         selectors = [
             'article[data-testid="status"]',
-            'article.status',
-            'div[class*="status"]',
+            'div[class*="status__wrapper"]',
+            'div[class*="status-"]',
             'div[class*="post"]',
             'article',
             'div[class*="entry"]',
+            'div[class*="item"]',
         ]
 
-        elements = []
+        element = None
         for sel in selectors:
             elements = page.query_selector_all(sel)
             if elements:
-                log.info("Screenshot: found %d elements with '%s'", len(elements), sel)
-                break
+                # Берём элемент с наибольшим текстом ( скорее всего пост)
+                best = None
+                best_len = 0
+                for el in elements:
+                    try:
+                        text_len = len(el.inner_text())
+                        if text_len > best_len:
+                            best_len = text_len
+                            best = el
+                    except:
+                        pass
+                if best and best_len > 20:
+                    element = best
+                    log.info("Screenshot: found element with '%s' (text len=%d)", sel, best_len)
+                    break
 
-        if elements:
-            # Скриншот конкретного элемента (обрезка под пост)
-            el = elements[0]
-            el.scroll_into_view_if_needed()
+        if element:
+            # Скриншот конкретного элемента — обре��ка точно под пост
+            element.scroll_into_view_if_needed()
             page.wait_for_timeout(500)
-            screenshot = el.screenshot(type="png")
+            screenshot = element.screenshot(type="png", animations="disabled")
             log.info("Screenshot: element cropped, %d bytes", len(screenshot))
         else:
-            # Ищем body с контентом
-            body = page.query_selector("body")
-            if body:
-                # Скриншот body с обрезкой по содержимому
-                screenshot = body.screenshot(type="png")
-                log.info("Screenshot: body cropped, %d bytes", len(screenshot))
-            else:
-                screenshot = page.screenshot(type="png")
-                log.info("Screenshot: full page, %d bytes", len(screenshot))
+            log.warning("Screenshot: no post element found, taking full page")
+            screenshot = page.screenshot(type="png", full_page=True)
+            log.info("Screenshot: full page, %d bytes", len(screenshot))
 
         context.close()
         return screenshot
