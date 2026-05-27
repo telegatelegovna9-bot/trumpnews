@@ -721,7 +721,6 @@ def main():
     if get_last_id() is None:
         log.info("First run — marking existing posts...")
         try:
-            # Пробуем RSSHub, потом API, потом Playwright
             posts = fetch_posts_via_rsshub(TRUTHSOCIAL_USERNAME, limit=5)
             if not posts:
                 posts = fetch_posts_via_api(TRUTHSOCIAL_USERNAME, limit=5)
@@ -729,35 +728,51 @@ def main():
                 posts = fetch_posts_via_playwright(browser, limit=5)
 
             if SEND_ON_FIRST_RUN and posts:
-                log.info("SEND_ON_FIRST_RUN=true — отправляем %d постов в Telegram", len(posts))
-                for p in reversed(posts):
-                    post_id = p["id"]
-                    text = p["text"]
-                    if len(text) < 10:
-                        mark_sent(post_id)
-                        continue
+                # Отправляем только последний (самый новый) пост
+                p = posts[0]
+                post_id = p["id"]
+                text = p["text"]
+                if len(text) >= 10:
                     emoji, label = analyze_sentiment(text)
                     translated = translate_to_russian(text)
                     url = p.get("url", "")
                     date = p.get("date", "")
+
+                    # Пробуем скриншот
+                    screenshot = take_screenshot(browser, url) if url else None
+
                     try:
-                        msg = (
-                            f"<b>🔴 Пост из Truth Social</b>\n"
-                            f"📅 {date} | {emoji} Тон: <b>{label}</b>\n\n"
-                            f"<b>🇺🇸 Оригинал:</b>\n{text}\n\n"
-                            f"<b>🇷🇺 Перевод:</b>\n{translated}\n\n"
-                            f'🔗 <a href="{url}">Открыть оригинал</a>'
-                        )
-                        send_text(msg)
-                        mark_sent(post_id)
-                        log.info("✅ Sent post %s", post_id)
+                        if screenshot:
+                            caption = (
+                                f"<b>🔴 Пост из Truth Social</b>\n"
+                                f"📅 {date} | {emoji} Тон: <b>{label}</b>\n\n"
+                                f"<b>🇷🇺 Перевод:</b>\n{translated}\n\n"
+                                f'🔗 <a href="{url}">Открыть оригинал</a>'
+                            )
+                            send_photo(screenshot, caption)
+                            log.info("✅ First run: screenshot sent for %s", post_id)
+                        else:
+                            msg = (
+                                f"<b>🔴 Пост из Truth Social</b>\n"
+                                f"📅 {date} | {emoji} Тон: <b>{label}</b>\n\n"
+                                f"<b>🇺🇸 Оригинал:</b>\n{text}\n\n"
+                                f"<b>🇷🇺 Перевод:</b>\n{translated}\n\n"
+                                f'🔗 <a href="{url}">Открыть оригинал</a>'
+                            )
+                            send_text(msg)
+                            log.info("✅ First run: text sent for %s", post_id)
                     except Exception as e:
-                        log.error("Send failed %s: %s", post_id, e)
+                        log.error("First run send failed: %s", e)
+
+                # Остальные просто помечаем
+                for p in posts[1:]:
+                    mark_sent(p["id"])
             else:
                 for p in posts:
                     mark_sent(p["id"])
 
             if posts:
+                mark_sent(posts[0]["id"])
                 set_last_id(posts[0]["id"])
                 log.info("Marked %d existing posts.", len(posts))
         except Exception as e:
