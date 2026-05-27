@@ -13,8 +13,10 @@ import re
 import logging
 import sqlite3
 import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 from dotenv import load_dotenv
@@ -473,10 +475,34 @@ def startup_check():
         TELEGRAM_THREAD_ID or "main",
     )
 
+# ─── Health Check Server (for Railway) ────────────────────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # Suppress health check logs
+
+
+def start_health_server():
+    """Запускает простой HTTP-сервер для Railway healthcheck."""
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info("Health server on port %d", port)
+    server.serve_forever()
+
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     startup_check()
+
+    # Запускаем healthcheck-сервер в отдельном потоке (Railway требует)
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(poll_once, "interval", minutes=POLL_INTERVAL, next_run_time=datetime.now())
