@@ -653,37 +653,31 @@ def fetch_posts_via_rsshub(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10
 
 
 def take_screenshot(pw_browser, post_url: str) -> bytes | None:
-    """Делает скриншот поста по его URL (обрезка под элемент поста)."""
+    """Делает скриншот карточки поста (обрезка точно под пост)."""
     if not post_url:
         return None
 
-    # Извлекаем ID поста из URL
-    # Формат: https://truthsocial.com/@realDonaldTrump/posts/123456
     post_id = post_url.rstrip("/").split("/")[-1]
-
-    # Пробуем embed-страницу (обычно не защищена Cloudflare)
     embed_url = f"https://truthsocial.com/embed/statuses/{post_id}"
 
     context = pw_browser.new_context(
-        viewport={"width": 1280, "height": 900},
+        viewport={"width": 1920, "height": 1080},
         locale="en-US",
         timezone_id="America/New_York",
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
-        extra_http_headers={
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
     )
     page = context.new_page()
     page.add_init_script(STEALTH_JS)
 
     try:
-        # Пробуем embed
+        # Пробуем embed, потом оригинальный URL
         log.info("Screenshot: trying embed %s", embed_url)
         page.goto(embed_url, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
 
         if is_cloudflare_challenge(page):
-            log.info("Embed blocked by CF, trying original URL %s", post_url)
+            log.info("Embed blocked, trying original %s", post_url)
             page.goto(post_url, wait_until="domcontentloaded", timeout=60000)
             for _ in range(5):
                 page.wait_for_timeout(4000)
@@ -692,52 +686,77 @@ def take_screenshot(pw_browser, post_url: str) -> bytes | None:
             page.wait_for_timeout(3000)
 
         if is_cloudflare_challenge(page):
-            log.warning("Screenshot: still blocked by Cloudflare")
+            log.warning("Screenshot: blocked by Cloudflare")
             context.close()
             return None
 
-        # Ищем пост на странице — более точные селекторы
-        selectors = [
-            'article[data-testid="status"]',
-            'div[class*="status__wrapper"]',
-            'div[class*="status-"]',
-            'div[class*="post"]',
-            'article',
-            'div[class*="entry"]',
-            'div[class*="item"]',
-        ]
+        # Ищем карточку поста через JS — самый надёжный способ
+        element = page.evaluate("""() => {
+            // Селекторы для карточки поста в Truth Social / Mastodon
+            const selectors = [
+                'article[data-testid="status"]',
+                'div.status__wrapper',
+                'div[class*="status"]',
+                'article.status',
+                'article',
+            ];
+            for (const sel of selectors) {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                    const text = el.innerText || '';
+                    // Проверяем что это пост (есть текст + не слишком большой)
+                    if (text.length > 30 && el.offsetWidth < window.innerWidth * 0.8) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }""")
 
-        element = None
-        for sel in selectors:
-            elements = page.query_selector_all(sel)
-            if elements:
-                # Берём элемент с наибольшим текстом ( скорее всего пост)
-                best = None
-                best_len = 0
-                for el in elements:
+        # Если JS нашёл — берём первый подходящий элемент
+        if element:
+            for sel in ['article[data-testid="status"]', 'div.status__wrapper', 'article.status', 'article']:
+                els = page.query_selector_all(sel)
+                for el in els:
                     try:
-                        text_len = len(el.inner_text())
-                        if text_len > best_len:
-                            best_len = text_len
-                            best = el
+                        txt = el.inner_text()
+                        if len(txt) > 30:
+                            el.scroll_into_view_if_needed()
+                            page.wait_for_timeout(300)
+                            screenshot = el.screenshot(type="png", animations="disabled")
+                            log.info("Screenshot: cropped to '%s', %d bytes", sel, len(screenshot))
+                            context.close()
+                            return screenshot
                     except:
                         pass
-                if best and best_len > 20:
-                    element = best
-                    log.info("Screenshot: found element with '%s' (text len=%d)", sel, best_len)
-                    break
 
-        if element:
-            # Скриншот конкретного элемента — обре��ка точно под пост
-            element.scroll_into_view_if_needed()
-            page.wait_for_timeout(500)
-            screenshot = element.screenshot(type="png", animations="disabled")
-            log.info("Screenshot: element cropped, %d bytes", len(screenshot))
-        else:
-            log.warning("Screenshot: no post element found, taking full page")
-            screenshot = page.screenshot(type="png", full_page=True)
-            log.info("Screenshot: full page, %d bytes", len(screenshot))
+        # Fallback — скриншот центральной области (без боковых панелей)
+        log.warning("Screenshot: using JS crop fallback")
+        screenshot = page.evaluate("""() => {
+            // Ищем основной контент (центральная колонка)
+            const main = document.querySelector('main, [role="main"], div[class*="feed"], div[class*="timeline"]');
+            if (main) {
+                const rect = main.getBoundingClientRect();
+                return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+            }
+            // Если не нашли — центр экрана
+            return {x: 300, y: 0, width: 800, height: 1000};
+        }""")
 
+        if screenshot and screenshot.get("width", 0) > 100:
+            screenshot_bytes = page.screenshot(
+                type="png",
+                clip=screenshot,
+                animations="disabled"
+            )
+            log.info("Screenshot: JS cropped to %dx%d, %d bytes", 
+                     screenshot["width"], screenshot["height"], len(screenshot_bytes))
+            context.close()
+            return screenshot_bytes
+
+        # Последний fallback — полная страница
+        screenshot = page.screenshot(type="png", full_page=True)
+        log.info("Screenshot: full page, %d bytes", len(screenshot))
         context.close()
         return screenshot
 
