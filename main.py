@@ -18,6 +18,12 @@ from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
 from playwright.sync_api import sync_playwright
+try:
+    from playwright_stealth import stealth_sync
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
+    log.warning("playwright-stealth not installed, using manual patches only")
 from bs4 import BeautifulSoup
 
 # ─── Config ────────────────────────────────────────────────────────────────────
@@ -133,28 +139,73 @@ def start_health_server():
 
 # ─── Core: Fetch posts via Playwright API interception ─────────────────────────
 
+STEALTH_JS = """
+// Stealth: скрываем headless-фингерпринты
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+window.chrome = {runtime: {}};
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications'
+        ? Promise.resolve({state: Notification.permission})
+        : originalQuery(parameters)
+);
+"""
+
+
+def is_cloudflare_challenge(page) -> bool:
+    """Проверяет, находимся ли мы на Cloudflare challenge page."""
+    try:
+        text = page.inner_text("body", timeout=3000)
+        indicators = [
+            "Performing security verification",
+            "Enable JavaScript and cookies",
+            "security service to protect",
+            "Checking your browser",
+            "Just a moment",
+        ]
+        return any(ind.lower() in text.lower() for ind in indicators)
+    except Exception:
+        return False
+
+
 def fetch_posts_via_playwright(pw_browser, limit: int = 10) -> list[dict]:
     """
-    Загружает профиль через Playwright, перехватывает API-ответы
-    и также пытается извлечь посты из DOM.
+    Загружает профиль через Playwright с stealth-патчами,
+    ждёт завершения Cloudflare challenge, затем перехватывает API и скрейпит DOM.
     """
     context = pw_browser.new_context(
-        viewport={"width": 1280, "height": 900},
+        viewport={"width": 1920, "height": 1080},
         locale="en-US",
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        timezone_id="America/New_York",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
+        extra_http_headers={
+            "Accept-Language": "en-US,en;q=0.9",
+            "sec-ch-ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        },
     )
     page = context.new_page()
 
-    # Перехватываем API-ответы с постами (только основную ленту)
+    # Применяем stealth-патчи ДО загрузки страницы
+    page.add_init_script(STEALTH_JS)
+    if HAS_STEALTH:
+        try:
+            stealth_sync(page)
+            log.info("playwright-stealth applied")
+        except Exception as e:
+            log.warning("playwright-stealth failed: %s", e)
+
+    # Перехватываем API-ответы с постами
     api_posts = []
     seen_ids = set()
 
     def handle_response(response):
         url = response.url
-        # Логируем все API-запросы к statuses для дебага
         if "/api/v1/accounts/" in url and "/statuses" in url:
-            log.info("API call: %s", url.split("?")[1] if "?" in url else "no params")
-            # Берём основную ленту (не pinned, не media-only)
+            log.info("API intercepted: %s", url.split("?")[0][-60:])
             if "pinned=true" not in url and "only_media=true" not in url:
                 try:
                     data = response.json()
@@ -164,7 +215,7 @@ def fetch_posts_via_playwright(pw_browser, limit: int = 10) -> list[dict]:
                             if post_id and post_id not in seen_ids:
                                 seen_ids.add(post_id)
                                 api_posts.append(item)
-                        log.info("Accepted %d statuses (total unique: %d)", len(data), len(api_posts))
+                        log.info("Accepted %d statuses (total: %d)", len(data), len(api_posts))
                 except Exception:
                     pass
 
@@ -174,7 +225,23 @@ def fetch_posts_via_playwright(pw_browser, limit: int = 10) -> list[dict]:
         profile_url = f"https://truthsocial.com/@{TRUTHSOCIAL_USERNAME}"
         log.info("Loading %s ...", profile_url)
         page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(8000)
+
+        # Ждём завершения Cloudflare challenge (до 30 сек)
+        for attempt in range(6):
+            page.wait_for_timeout(5000)
+            if not is_cloudflare_challenge(page):
+                log.info("✅ Cloudflare challenge passed (attempt %d)", attempt + 1)
+                break
+            log.info("Cloudflare challenge active, waiting... (attempt %d)", attempt + 1)
+            # Иногда нужен клик или перезагрузка
+            if attempt == 3:
+                log.info("Reloading page...")
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+        else:
+            log.warning("Cloudflare challenge NOT passed after 30s")
+
+        # Даём время на загрузку контента после challenge
+        page.wait_for_timeout(3000)
 
         # Метод 2: API через браузер (обходит Cloudflare)
         if not api_posts:
@@ -433,13 +500,31 @@ def take_screenshot(pw_browser, post_url: str) -> bytes | None:
     context = pw_browser.new_context(
         viewport={"width": 1280, "height": 900},
         locale="en-US",
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        timezone_id="America/New_York",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
+        extra_http_headers={
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     )
     page = context.new_page()
+    page.add_init_script(STEALTH_JS)
+    if HAS_STEALTH:
+        try:
+            stealth_sync(page)
+        except Exception:
+            pass
+
     try:
         log.info("Screenshot: loading %s", post_url)
         page.goto(post_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(5000)
+
+        # Ждём завершения Cloudflare challenge
+        for _ in range(5):
+            page.wait_for_timeout(4000)
+            if not is_cloudflare_challenge(page):
+                break
+        else:
+            page.wait_for_timeout(3000)
 
         # Ищем пост на странице
         selectors = [
