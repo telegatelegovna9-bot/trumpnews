@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
 from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -229,6 +230,23 @@ def scrape_dom(page, limit: int) -> list[dict]:
             break
 
     if not elements:
+        # Дебаг: дампим часть HTML чтобы понять структуру
+        try:
+            html = page.content()
+            # Ищем любые элементы с текстом от Trump
+            soup = BeautifulSoup(html, "html.parser")
+            articles = soup.find_all("article")
+            divs_with_class = soup.find_all("div", class_=True)
+            log.warning("DOM debug: page has %d <article>, %d <div> with classes", len(articles), len(divs_with_class))
+            if articles:
+                for i, art in enumerate(articles[:3]):
+                    log.warning("  article[%d] classes=%s text=%.200s", i, art.get("class", []), art.get_text(strip=True))
+            # Пишем HTML в файл для ручного анализа
+            dump_path = Path(__file__).parent / "debug_page.html"
+            dump_path.write_text(html[:100000], encoding="utf-8")
+            log.info("HTML dumped to %s (%d bytes)", dump_path, len(html))
+        except Exception as e:
+            log.warning("DOM debug failed: %s", e)
         return []
 
     log.info("DOM: found %d elements with '%s'", len(elements), used_sel)
@@ -276,6 +294,86 @@ def strip_html(html: str) -> str:
     for entity, char in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&#39;", "'"), ("&quot;", '"'), ("&nbsp;", " ")]:
         text = text.replace(entity, char)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+# ─── Direct Mastodon API ──────────────────────────────────────────────────────
+
+_cached_account_id: str | None = None
+
+def get_account_id(username: str) -> str | None:
+    """Получает ID аккаунта через Mastodon-compatible API."""
+    global _cached_account_id
+    if _cached_account_id:
+        return _cached_account_id
+
+    url = f"https://truthsocial.com/api/v1/accounts/lookup?acct={username}"
+    try:
+        log.info("API lookup: %s", url)
+        r = requests.get(url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        })
+        log.info("API lookup status: %d", r.status_code)
+        if r.status_code == 200:
+            data = r.json()
+            account_id = str(data.get("id", ""))
+            if account_id:
+                _cached_account_id = account_id
+                log.info("✅ Account ID: %s", account_id)
+                return account_id
+        else:
+            log.warning("API lookup failed: %d — %s", r.status_code, r.text[:300])
+    except Exception as e:
+        log.warning("API lookup error: %s", e)
+    return None
+
+
+def fetch_posts_via_api(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10) -> list[dict]:
+    """Получает посты напрямую через Mastodon API (без браузера)."""
+    account_id = get_account_id(username)
+    if not account_id:
+        log.warning("Cannot get account ID, API method unavailable")
+        return []
+
+    url = f"https://truthsocial.com/api/v1/accounts/{account_id}/statuses"
+    params = {"limit": limit}
+    try:
+        log.info("API fetch: %s?limit=%d", url, limit)
+        r = requests.get(url, params=params, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        })
+        log.info("API fetch status: %d", r.status_code)
+
+        if r.status_code != 200:
+            log.warning("API fetch failed: %d — %s", r.status_code, r.text[:300])
+            return []
+
+        data = r.json()
+        if not isinstance(data, list):
+            log.warning("API returned non-list: %s", type(data).__name__)
+            return []
+
+        posts = []
+        for item in data:
+            post_id = str(item.get("id", ""))
+            text = strip_html(item.get("content", ""))
+            if not text or len(text) < 10:
+                continue
+            posts.append({
+                "id": post_id,
+                "text": text,
+                "url": item.get("url", ""),
+                "date": item.get("created_at", "")[:10],
+                "media": [m.get("type", "") for m in item.get("media_attachments", [])],
+            })
+
+        log.info("✅ API: got %d posts", len(posts))
+        return posts
+
+    except Exception as e:
+        log.error("API fetch error: %s", e)
+        return []
 
 
 def take_screenshot(pw_browser, post_url: str) -> bytes | None:
@@ -332,7 +430,14 @@ def take_screenshot(pw_browser, post_url: str) -> bytes | None:
 
 def poll_once(pw_browser):
     log.info("Polling @%s ...", TRUTHSOCIAL_USERNAME)
-    posts = fetch_posts_via_playwright(pw_browser, limit=10)
+
+    # Метод 1: Прямой API-запрос (быстрый, без браузера)
+    posts = fetch_posts_via_api(TRUTHSOCIAL_USERNAME, limit=10)
+
+    # Метод 2: Playwright (fallback)
+    if not posts:
+        log.info("API вернул 0 постов, пробуем Playwright...")
+        posts = fetch_posts_via_playwright(pw_browser, limit=10)
 
     if not posts:
         log.info("No posts found.")
@@ -414,7 +519,10 @@ def main():
     if get_last_id() is None:
         log.info("First run — marking existing posts...")
         try:
-            posts = fetch_posts_via_playwright(browser, limit=5)
+            # Пробуем API, потом Playwright
+            posts = fetch_posts_via_api(TRUTHSOCIAL_USERNAME, limit=5)
+            if not posts:
+                posts = fetch_posts_via_playwright(browser, limit=5)
             for p in posts:
                 mark_sent(p["id"])
             if posts:
