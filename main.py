@@ -653,12 +653,19 @@ def fetch_posts_via_rsshub(username: str = TRUTHSOCIAL_USERNAME, limit: int = 10
 
 
 def take_screenshot(pw_browser, post_url: str) -> bytes | None:
-    """Делает скриншот поста по его URL."""
+    """Делает скриншот поста по его URL (через embed-страницу)."""
     if not post_url:
         return None
 
+    # Извлекаем ID поста из URL
+    # Формат: https://truthsocial.com/@realDonaldTrump/posts/123456
+    post_id = post_url.rstrip("/").split("/")[-1]
+
+    # Пробуем embed-страницу (обычно не защищена Cloudflare)
+    embed_url = f"https://truthsocial.com/embed/statuses/{post_id}"
+
     context = pw_browser.new_context(
-        viewport={"width": 1280, "height": 900},
+        viewport={"width": 600, "height": 800},
         locale="en-US",
         timezone_id="America/New_York",
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
@@ -670,46 +677,63 @@ def take_screenshot(pw_browser, post_url: str) -> bytes | None:
     page.add_init_script(STEALTH_JS)
 
     try:
-        log.info("Screenshot: loading %s", post_url)
-        page.goto(post_url, wait_until="domcontentloaded", timeout=60000)
+        # Пробуем embed
+        log.info("Screenshot: trying embed %s", embed_url)
+        page.goto(embed_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(3000)
 
-        # Ждём завершения Cloudflare challenge
-        for _ in range(5):
-            page.wait_for_timeout(4000)
-            if not is_cloudflare_challenge(page):
-                break
-        else:
+        if is_cloudflare_challenge(page):
+            log.info("Embed blocked by CF, trying original URL %s", post_url)
+            page.goto(post_url, wait_until="domcontentloaded", timeout=60000)
+            for _ in range(5):
+                page.wait_for_timeout(4000)
+                if not is_cloudflare_challenge(page):
+                    break
             page.wait_for_timeout(3000)
+
+        if is_cloudflare_challenge(page):
+            log.warning("Screenshot: still blocked by Cloudflare")
+            context.close()
+            return None
 
         # Ищем пост на странице
         selectors = [
             'article[data-testid="status"]',
             'article.status',
             'div[class*="status"]',
+            'div[class*="post"]',
             'article',
+            'div[class*="entry"]',
         ]
 
         elements = []
         for sel in selectors:
             elements = page.query_selector_all(sel)
             if elements:
+                log.info("Screenshot: found %d elements with '%s'", len(elements), sel)
                 break
 
-        if not elements:
-            log.warning("Screenshot: no elements found on %s", post_url)
-            # Скриншот всей страницы как fallback
-            screenshot = page.screenshot(type="png")
-            context.close()
-            return screenshot
+        if elements:
+            # Скриншот конкретного элемента (обрезка под пост)
+            el = elements[0]
+            el.scroll_into_view_if_needed()
+            page.wait_for_timeout(500)
+            screenshot = el.screenshot(type="png")
+            log.info("Screenshot: element cropped, %d bytes", len(screenshot))
+        else:
+            # Ищем body с контентом
+            body = page.query_selector("body")
+            if body:
+                # Скриншот body с обрезкой по содержимому
+                screenshot = body.screenshot(type="png")
+                log.info("Screenshot: body cropped, %d bytes", len(screenshot))
+            else:
+                screenshot = page.screenshot(type="png")
+                log.info("Screenshot: full page, %d bytes", len(screenshot))
 
-        # Берём первый (основной) элемент — на странице поста он один
-        el = elements[0]
-        el.scroll_into_view_if_needed()
-        page.wait_for_timeout(500)
-        screenshot = el.screenshot(type="png")
-        log.info("Screenshot: %d bytes", len(screenshot))
         context.close()
         return screenshot
+
     except Exception as e:
         log.error("Screenshot failed: %s", e)
         context.close()
@@ -756,8 +780,9 @@ def poll_once(pw_browser):
         url = post.get("url", "")
         date = post.get("date", "")
 
-        # Генерируем картинку из текста
-        img_bytes = generate_post_image(text, date, label)
+        # Пробуем реальный скриншот, если не вышло — генерируем картинку
+        screenshot = take_screenshot(pw_browser, url) if url else None
+        img_bytes = screenshot if screenshot else generate_post_image(text, date, label)
 
         try:
             if img_bytes:
@@ -831,8 +856,9 @@ def main():
                     url = p.get("url", "")
                     date = p.get("date", "")
 
-                    # Генерируем картинку
-                    img_bytes = generate_post_image(text, date, label)
+                    # Пробуем реальный скриншот, если не вышло — генерируем картинку
+                    screenshot = take_screenshot(browser, url) if url else None
+                    img_bytes = screenshot if screenshot else generate_post_image(text, date, label)
 
                     try:
                         if img_bytes:
