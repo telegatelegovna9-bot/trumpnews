@@ -18,12 +18,6 @@ from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 from textblob import TextBlob
 from playwright.sync_api import sync_playwright
-try:
-    from playwright_stealth import stealth_sync
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
-    log.warning("playwright-stealth not installed, using manual patches only")
 from bs4 import BeautifulSoup
 
 # ─── Config ────────────────────────────────────────────────────────────────────
