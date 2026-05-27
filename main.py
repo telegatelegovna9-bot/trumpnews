@@ -410,85 +410,145 @@ def strip_html(html: str) -> str:
 
 
 def generate_post_image(text: str, date: str = "", sentiment_label: str = "") -> bytes | None:
-    """Генерирует картинку-карточку поста из текста."""
+    """Генерирует картинку-карточку поста в стиле Truth Social (dark mode)."""
     try:
-        # Настройки
-        width = 800
-        padding = 40
-        bg_color = (22, 22, 22)  # Тёмный фон
-        text_color = (255, 255, 255)
-        accent_color = (29, 155, 240)  # Синий акцент
-        header_color = (255, 69, 0)  # Красный для заголовка
+        from io import BytesIO
+        
+        # Truth Social dark mode цвета
+        BG = (21, 32, 43)          # Тёмно-синий фон (как в Truth Social)
+        CARD_BG = (25, 35, 50)     # Фон карточки
+        BORDER = (56, 68, 77)      # Граница
+        WHITE = (255, 255, 255)
+        LIGHT_GRAY = (200, 210, 220)  # Светлый серый для текста
+        GRAY = (136, 153, 166)     # Серый текст
+        BLUE = (29, 155, 240)      # Синий акцент (как галочка)
+        RED = (249, 24, 128)       # Красный/розовый для лайков
 
-        # Шрифт (попробуем несколько путей)
+        width = 580
+        padding = 16
+        avatar_size = 48
+        content_x = padding + avatar_size + 12  # Отступ после аватара
+
+        # Шрифты
         font_path = None
-        possible_fonts = [
+        for fp in [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
             "C:/Windows/Fonts/arial.ttf",
-        ]
-        for fp in possible_fonts:
+            "C:/Windows/Fonts/arialbd.ttf",
+        ]:
             if Path(fp).exists():
                 font_path = fp
                 break
 
-        if font_path:
-            font_header = ImageFont.truetype(font_path, 22)
-            font_body = ImageFont.truetype(font_path, 18)
-            font_small = ImageFont.truetype(font_path, 14)
-        else:
-            font_header = ImageFont.load_default()
-            font_body = ImageFont.load_default()
-            font_small = ImageFont.load_default()
+        def get_font(size, bold=False):
+            if font_path:
+                if bold:
+                    bold_path = font_path.replace("Regular", "Bold").replace("Sans.ttf", "Sans-Bold.ttf")
+                    if not Path(bold_path).exists():
+                        bold_path = font_path.replace(".ttf", "-Bold.ttf")
+                    if Path(bold_path).exists():
+                        try:
+                            return ImageFont.truetype(bold_path, size)
+                        except:
+                            pass
+                try:
+                    return ImageFont.truetype(font_path, size)
+                except:
+                    pass
+            return ImageFont.load_default()
 
-        # Обёртка текста
-        chars_per_line = 55
+        font_name = get_font(16, bold=True)
+        font_handle = get_font(14)
+        font_text = get_font(15)
+        font_small = get_font(13)
+        font_action = get_font(13)
+
+        # Обёртка текста поста
+        chars_per_line = 45
         wrapped = textwrap.fill(text, width=chars_per_line)
         lines = wrapped.split("\n")
+        line_height = 22
 
-        # Высота картинки
-        line_height = 26
-        header_height = 60
-        footer_height = 40
-        total_height = padding + header_height + 10 + (len(lines) * line_height) + footer_height + padding
+        # Высота карточки
+        header_h = 55  # Аватар + имя + хэндл
+        text_h = len(lines) * line_height
+        actions_h = 35
+        total_height = padding + header_h + text_h + 20 + actions_h + padding
 
         # Создаём картинку
-        img = Image.new("RGB", (width, total_height), bg_color)
+        img = Image.new("RGB", (width, total_height), BG)
         draw = ImageDraw.Draw(img)
 
-        # Заголовок
+        # Фон карточки с закруглёнными углами
+        card_rect = [(2, 2), (width - 3, total_height - 3)]
+        draw.rounded_rectangle(card_rect, radius=12, fill=CARD_BG, outline=BORDER, width=1)
+
         y = padding
-        draw.text((padding, y), "🔴 Пост из Truth Social", fill=header_color, font=font_header)
-        y += 30
 
-        # Дата и тон
-        meta_parts = []
+        # Аватар (круг с инициалами "T")
+        avatar_x = padding
+        avatar_y = y
+        draw.ellipse(
+            [(avatar_x, avatar_y), (avatar_x + avatar_size, avatar_y + avatar_size)],
+            fill=(29, 161, 242)  # Синий круг
+        )
+        # Белая буква "T" по центру
+        t_font = get_font(24, bold=True)
+        draw.text((avatar_x + 15, avatar_y + 10), "T", fill=WHITE, font=t_font)
+
+        # Имя
+        name_x = content_x
+        draw.text((name_x, y + 2), "Donald J. Trump", fill=WHITE, font=font_name)
+        
+        # Галочка verified (синяя)
+        name_w = draw.textlength("Donald J. Trump", font=font_name)
+        check_x = name_x + name_w + 6
+        # Рисуем синий кружок с галочкой
+        check_size = 18
+        draw.ellipse(
+            [(check_x, y + 3), (check_x + check_size, y + 3 + check_size)],
+            fill=BLUE
+        )
+        draw.text((check_x + 3, y + 3), "✓", fill=WHITE, font=get_font(12, bold=True))
+
+        # Хэндл и дата
+        y += 24
+        handle_text = f"@realDonaldTrump"
+        draw.text((name_x, y), handle_text, fill=GRAY, font=font_handle)
         if date:
-            meta_parts.append(f"📅 {date}")
-        if sentiment_label:
-            meta_parts.append(f"🎭 {sentiment_label}")
-        if meta_parts:
-            draw.text((padding, y), " | ".join(meta_parts), fill=accent_color, font=font_small)
-        y += 25
-
-        # Разделитель
-        draw.line([(padding, y), (width - padding, y)], fill=(60, 60, 60), width=1)
-        y += 15
+            date_text = f" · {date}"
+            handle_w = draw.textlength(handle_text, font=font_handle)
+            draw.text((name_x + handle_w, y), date_text, fill=GRAY, font=font_handle)
 
         # Текст поста
+        y += 22
         for line in lines:
-            draw.text((padding, y), line, fill=text_color, font=font_body)
+            draw.text((padding + 4, y), line, fill=WHITE, font=font_text)
             y += line_height
 
-        # Футер
-        y += 10
-        draw.line([(padding, y), (width - padding, y)], fill=(60, 60, 60), width=1)
-        y += 10
-        draw.text((padding, y), "Truth Social • @realDonaldTrump", fill=(120, 120, 120), font=font_small)
+        # Разделитель
+        y += 12
+        draw.line([(padding + 4, y), (width - padding - 4, y)], fill=BORDER, width=1)
+        y += 12
 
-        # Конвертим в bytes
-        from io import BytesIO
+        # Кнопки действий
+        actions = [
+            ("💬", "Reply"),
+            ("🔁", "Repost"),
+            ("❤️", "Like"),
+            ("📊", "Views"),
+            ("📤", "Share"),
+        ]
+        action_x = padding + 4
+        action_spacing = (width - 2 * padding - 8) // len(actions)
+        for icon, label in actions:
+            draw.text((action_x, y), icon, fill=GRAY, font=font_action)
+            action_x += action_spacing
+
+        # Конвер��им в bytes
         buf = BytesIO()
         img.save(buf, format="PNG", quality=95)
         return buf.getvalue()
@@ -806,9 +866,8 @@ def poll_once(pw_browser):
         url = post.get("url", "")
         date = post.get("date", "")
 
-        # Пробуем реальный скриншот, если не вышло — генерируем картинку
-        screenshot = take_screenshot(pw_browser, url) if url else None
-        img_bytes = screenshot if screenshot else generate_post_image(text, date, label)
+        # Генерируем картинку поста
+        img_bytes = generate_post_image(text, date, label)
 
         try:
             if img_bytes:
@@ -883,9 +942,8 @@ def main():
                     url = p.get("url", "")
                     date = p.get("date", "")
 
-                    # Пробуем реальный скриншот, если не вышло — генерируем картинку
-                    screenshot = take_screenshot(browser, url) if url else None
-                    img_bytes = screenshot if screenshot else generate_post_image(text, date, label)
+                    # Генерируем картинку поста
+                    img_bytes = generate_post_image(text, date, label)
 
                     try:
                         if img_bytes:
