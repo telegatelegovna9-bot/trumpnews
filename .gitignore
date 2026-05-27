@@ -1,0 +1,9 @@
+.env
+state.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+# Utility scripts
+test_api.py
+find_thread.py
