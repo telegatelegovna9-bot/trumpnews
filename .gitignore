@@ -1,9 +1,33 @@
+# Environment variables
 .env
-state.db
+
+# Python
 __pycache__/
-*.pyc
-.venv/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
 venv/
-# Utility scripts
-test_api.py
-find_thread.py
+.venv/
+env/
+
+# Screenshots (generated at runtime)
+screenshots/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
