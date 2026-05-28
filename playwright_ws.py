@@ -57,14 +57,12 @@ class PlaywrightMonitor:
 
             self._pw = await async_playwright().start()
             self._browser = await self._pw.chromium.launch(
-                headless=True,
+                headless=False,  # Real browser with Xvfb display
                 args=[
-                    "--headless=new",
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
-                    "--disable-features=IsolateOrigins,site-per-process",
                     "--disable-infobars",
                     "--window-size=1920,1080",
                 ],

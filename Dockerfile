@@ -2,10 +2,10 @@ FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
 
 WORKDIR /app
 
-# Install system deps for curl_cffi (libcurl, libffi)
+# Install Xvfb for virtual display (non-headless Chrome)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libcurl4-openssl-dev \
-    libffi-dev \
+    xvfb \
+    xauth \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -21,4 +21,5 @@ COPY . .
 # Create screenshots directory
 RUN mkdir -p screenshots
 
-CMD ["python", "-u", "main.py"]
+# Start with Xvfb — runs Chrome with virtual display (bypasses Cloudflare)
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1920x1080x24 -ac & export DISPLAY=:99 && python -u main.py"]
