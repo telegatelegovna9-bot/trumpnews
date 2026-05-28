@@ -67,24 +67,25 @@ class PlaywrightMonitor:
             logger.error("curl_cffi init failed")
             return
 
-        # Get account ID
+        # Get account ID via curl_cffi
         loop = asyncio.get_event_loop()
         self._account_id = await loop.run_in_executor(None, self._fetch_account_id)
 
         if not self._account_id:
-            logger.warning("First attempt failed. Retrying in 30s...")
-            await asyncio.sleep(30)
-            self._account_id = await loop.run_in_executor(None, self._fetch_account_id)
+            logger.info("curl_cffi blocked. Trying Playwright Firefox...")
+            if await self._try_playwright_api():
+                logger.info("Playwright API worked!")
+            else:
+                logger.warning("Both methods blocked. Waiting 10 min...")
+                await asyncio.sleep(600)
+                # Try once more
+                self._account_id = await loop.run_in_executor(None, self._fetch_account_id)
+                if not self._account_id:
+                    logger.error("Still blocked. Monitor will keep retrying.")
 
         if not self._account_id:
-            logger.error("Cannot get account ID. Cloudflare is blocking.")
-            # Wait long and retry
-            logger.info("Waiting 10 min before retry...")
-            await asyncio.sleep(600)
-            self._account_id = await loop.run_in_executor(None, self._fetch_account_id)
-
-        if not self._account_id:
-            logger.error("Still blocked. Giving up on curl_cffi.")
+            # Start poll loop anyway — will retry
+            await self._poll_loop()
             return
 
         # Mark existing posts
@@ -96,15 +97,91 @@ class PlaywrightMonitor:
         # Start polling
         await self._poll_loop()
 
+    async def _try_playwright_api(self) -> bool:
+        """Try to get account ID via Playwright Firefox (bypasses Cloudflare sometimes)."""
+        try:
+            from playwright.async_api import async_playwright
+
+            pw = await async_playwright().start()
+            browser = await pw.firefox.launch(headless=True)
+            context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            )
+            page = await context.new_page()
+
+            url = TRUTHSOCIAL_URL.format(username=self.username)
+            await page.goto(url, wait_until="commit", timeout=30000)
+            await asyncio.sleep(5)
+
+            title = await page.title()
+            logger.info(f"Playwright fallback: title = {title}")
+
+            if "Just a moment" in title or "Cloudflare" in title:
+                # Wait for Cloudflare
+                for i in range(12):
+                    await asyncio.sleep(5)
+                    title = await page.title()
+                    if "Just a moment" not in title and "Cloudflare" not in title:
+                        break
+
+            if "Just a moment" in title:
+                await browser.close()
+                await pw.stop()
+                return False
+
+            # Try to get account ID via browser API
+            account = await page.evaluate("""
+                async () => {
+                    const r = await fetch('/api/v1/accounts/lookup?acct=""" + self.username + """', {credentials:'include'});
+                    if (!r.ok) return null;
+                    return await r.json();
+                }
+            """)
+
+            if account and account.get("id"):
+                self._account_id = str(account["id"])
+                logger.info(f"Playwright fallback: account ID = {self._account_id}")
+                # Store for later use
+                self._pw = pw
+                self._browser = browser
+                self._context = context
+                self._page = page
+                return True
+
+            await browser.close()
+            await pw.stop()
+            return False
+
+        except Exception as e:
+            logger.error(f"Playwright fallback error: {e}")
+            return False
+
     def _init_curl(self) -> bool:
         try:
             from curl_cffi.requests import Session
-            self._scraper = Session(
-                impersonate="chrome120",
-                headers=HEADERS,
-            )
-            logger.info("curl_cffi ready (impersonate=chrome120)")
+
+            # Try multiple impersonation profiles
+            profiles = ["chrome131", "chrome120", "chrome116", "safari17_0", "safari15_5", "edge101"]
+
+            for profile in profiles:
+                try:
+                    self._scraper = Session(impersonate=profile, headers=HEADERS)
+                    # Quick test
+                    resp = self._scraper.get("https://truthsocial.com/", timeout=10)
+                    logger.info(f"curl_cffi {profile}: HTTP {resp.status_code}")
+                    if resp.status_code != 403:
+                        logger.info(f"Using profile: {profile}")
+                        return True
+                except Exception as e:
+                    logger.debug(f"Profile {profile} failed: {e}")
+                    continue
+
+            # All profiles got 403 — use last one anyway
+            logger.warning("All profiles got 403, using chrome131 anyway")
+            self._scraper = Session(impersonate="chrome131", headers=HEADERS)
             return True
+
         except ImportError:
             logger.error("curl_cffi not installed")
             return False
