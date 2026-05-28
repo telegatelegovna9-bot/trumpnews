@@ -116,63 +116,112 @@ class PlaywrightMonitor:
             url = TRUTHSOCIAL_URL.format(username=self.username)
             logger.info(f"Playwright: navigating to {url}")
 
-            try:
-                await self._page.goto(url, wait_until="commit", timeout=30000)
-            except Exception as e:
-                logger.warning(f"Playwright: navigation commit error: {e}")
+            # Try up to 3 times to pass Cloudflare
+            for attempt in range(3):
+                try:
+                    await self._page.goto(url, wait_until="commit", timeout=30000)
+                except Exception as e:
+                    logger.warning(f"Playwright: navigation error (attempt {attempt+1}): {e}")
 
-            # Wait for Cloudflare challenge
-            await self._wait_for_cloudflare()
+                await self._wait_for_cloudflare()
 
-            # Check final state
-            try:
-                title = await self._page.title()
-                url_now = self._page.url
-                logger.info(f"Playwright: final title = {title}")
-                logger.info(f"Playwright: final URL = {url_now}")
-            except Exception:
-                pass
+                # Check if we passed
+                try:
+                    title = await self._page.title()
+                    if "Just a moment" not in title and "Cloudflare" not in title:
+                        logger.info(f"Playwright: final title = {title}")
+                        logger.info(f"Playwright: final URL = {self._page.url}")
+                        return True
+                except Exception:
+                    pass
 
-            return True
+                # Didn't pass — try reload
+                if attempt < 2:
+                    logger.info(f"Playwright: retrying Cloudflare (attempt {attempt+2}/3)...")
+                    await asyncio.sleep(5)
+                    try:
+                        await self._page.reload(wait_until="commit", timeout=20000)
+                    except Exception:
+                        pass
+
+            logger.warning("Playwright: could not pass Cloudflare after 3 attempts")
+            return True  # Still return True — DOM scraping might work later
 
         except Exception as e:
             logger.error(f"Playwright init error: {e}", exc_info=True)
             return False
 
     async def _wait_for_cloudflare(self):
-        """Wait for Cloudflare challenge to resolve."""
+        """Wait for Cloudflare challenge to resolve. Handles Turnstile iframe."""
         logger.info("Playwright: waiting for Cloudflare challenge...")
 
-        for i in range(12):  # Up to 60 seconds
+        for i in range(15):  # Up to 75 seconds
             await asyncio.sleep(5)
 
             try:
                 title = await self._page.title()
-                content = await self._page.content()
 
                 # Check if we're past Cloudflare
                 if "Just a moment" not in title and "Cloudflare" not in title:
                     logger.info(f"Playwright: Cloudflare passed! Title: {title}")
                     return
 
-                # Check if there's a Turnstile checkbox to click
-                turnstile = await self._page.query_selector(
-                    'input[type="checkbox"], .cf-turnstile, #challenge-stage, iframe[src*="challenges.cloudflare.com"]'
-                )
-                if turnstile:
-                    logger.info("Playwright: found Turnstile/challenge element, attempting click...")
-                    try:
-                        await turnstile.click()
-                        await asyncio.sleep(3)
-                    except Exception:
-                        pass
+                # Try to find and click Turnstile checkbox
+                # Method 1: Click inside Turnstile iframe
+                try:
+                    frames = self._page.frames
+                    for frame in frames:
+                        url = frame.url
+                        if "challenges.cloudflare.com" in url or "turnstile" in url:
+                            logger.info(f"Playwright: found Cloudflare frame: {url[:80]}")
+                            # Try to find checkbox/button inside the frame
+                            checkbox = await frame.query_selector('input[type="checkbox"]')
+                            if checkbox:
+                                await checkbox.click()
+                                logger.info("Playwright: clicked Turnstile checkbox in iframe")
+                                await asyncio.sleep(3)
+                                continue
+
+                            # Try clicking anywhere in the frame
+                            body = await frame.query_selector('body')
+                            if body:
+                                await body.click()
+                                logger.info("Playwright: clicked Turnstile frame body")
+                                await asyncio.sleep(3)
+                except Exception as e:
+                    logger.debug(f"Turnstile iframe handling: {e}")
+
+                # Method 2: Click on the challenge stage area
+                try:
+                    challenge = await self._page.query_selector('#challenge-stage, .cf-turnstile, [id*="challenge"]')
+                    if challenge:
+                        box = await challenge.bounding_box()
+                        if box:
+                            # Click in the center of the challenge area
+                            await self._page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                            logger.info("Playwright: clicked challenge area")
+                            await asyncio.sleep(3)
+                except Exception:
+                    pass
+
+                # Method 3: Try clicking on any visible checkbox
+                try:
+                    checkboxes = await self._page.query_selector_all('input[type="checkbox"]')
+                    for cb in checkboxes:
+                        if await cb.is_visible():
+                            await cb.click()
+                            logger.info("Playwright: clicked visible checkbox")
+                            await asyncio.sleep(3)
+                            break
+                except Exception:
+                    pass
 
                 logger.info(f"Playwright: still on Cloudflare... ({(i+1)*5}s)")
 
             except Exception:
                 pass
 
-        logger.warning("Playwright: Cloudflare challenge did not resolve in 60s")
+        logger.warning("Playwright: Cloudflare challenge did not resolve in 75s")
 
     async def _apply_stealth(self, page):
         """Apply stealth JavaScript."""
