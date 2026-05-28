@@ -2,7 +2,7 @@ FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
 
 WORKDIR /app
 
-# Install Xvfb for virtual display (non-headless Chrome)
+# Install Xvfb for virtual display
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     xauth \
@@ -18,8 +18,7 @@ RUN playwright install --with-deps chromium
 # Copy app
 COPY . .
 
-# Create screenshots directory
 RUN mkdir -p screenshots
 
-# Start with Xvfb — runs Chrome with virtual display (bypasses Cloudflare)
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1920x1080x24 -ac & export DISPLAY=:99 && python -u main.py"]
+# xvfb-run automatically starts virtual display and sets $DISPLAY
+CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1920x1080x24", "python", "-u", "main.py"]
