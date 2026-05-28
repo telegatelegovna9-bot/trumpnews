@@ -11,6 +11,9 @@ websockets>=12.0
 # Browser automation
 playwright>=1.40.0
 
+# Virtual display for non-headless Chrome (Cloudflare bypass)
+pyvirtualdisplay>=3.0
+
 # Translation & NLP
 deep-translator>=1.11.0
 textblob>=0.18.0
