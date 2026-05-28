@@ -56,14 +56,32 @@ class PlaywrightMonitor:
             from playwright.async_api import async_playwright
 
             self._pw = await async_playwright().start()
+
+            # Try Firefox first (less detectable by Cloudflare)
+            try:
+                logger.info("Trying Firefox...")
+                self._browser = await self._pw.firefox.launch(headless=True)
+                self._context = await self._browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+                    locale="en-US",
+                )
+                self._page = await self._context.new_page()
+                logger.info("Firefox ready")
+                return True
+            except Exception as e:
+                logger.warning(f"Firefox failed: {e}")
+
+            # Fallback to Chromium headless
+            logger.info("Falling back to Chromium...")
             self._browser = await self._pw.chromium.launch(
-                headless=False,  # Real browser with Xvfb display
+                headless=True,
                 args=[
+                    "--headless=new",
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
-                    "--disable-infobars",
                     "--window-size=1920,1080",
                 ],
             )
@@ -71,11 +89,9 @@ class PlaywrightMonitor:
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-US",
-                timezone_id="America/New_York",
             )
             self._page = await self._context.new_page()
 
-            # Stealth
             await self._page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 delete navigator.__proto__.webdriver;
@@ -85,7 +101,7 @@ class PlaywrightMonitor:
                 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
                 Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
             """)
-            logger.info("Browser ready")
+            logger.info("Chromium ready")
             return True
 
         except Exception as e:
