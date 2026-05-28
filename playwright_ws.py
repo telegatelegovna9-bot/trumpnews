@@ -48,7 +48,15 @@ class PlaywrightMonitor:
         if not await self._init_browser():
             return
 
-        await self._initial_scrape()
+        # Try initial scrape
+        success = await self._initial_scrape()
+
+        if not success:
+            # Cloudflare blocked — wait long before retrying
+            logger.info("Initial scrape failed. Waiting 10 min before polling...")
+            await asyncio.sleep(600)
+
+        # Start polling
         await self._poll_loop()
 
     async def _init_browser(self) -> bool:
@@ -157,20 +165,19 @@ class PlaywrightMonitor:
             logger.error(f"Fetch error: {e}")
         return []
 
-    async def _initial_scrape(self):
-        """Load page, fetch posts, send latest to Telegram."""
+    async def _initial_scrape(self) -> bool:
+        """Load page, fetch posts, send latest to Telegram. Returns True if successful."""
         if not await self._load_page():
-            return
+            return False
 
         statuses = await self._fetch_posts()
         if not statuses:
-            # Wait a bit and retry
             await asyncio.sleep(10)
             statuses = await self._fetch_posts()
 
         if not statuses:
             logger.warning("No posts found")
-            return
+            return False
 
         # Send latest post to Telegram
         latest = statuses[0]
@@ -197,20 +204,32 @@ class PlaywrightMonitor:
         for s in statuses:
             self._seen_ids.add(str(s.get("id", "")))
         logger.info(f"Marked {len(self._seen_ids)} posts as seen")
+        return True
 
     async def _poll_loop(self):
         """Poll for new posts."""
         await asyncio.sleep(self.interval)
+        cf_failures = 0
 
         while self._running:
             try:
                 statuses = await self._fetch_posts()
 
                 if not statuses:
-                    # Maybe page lost cookies — reload
-                    logger.info("No statuses, reloading page...")
-                    if await self._load_page():
-                        statuses = await self._fetch_posts()
+                    cf_failures += 1
+                    if cf_failures >= 3:
+                        # Cloudflare is blocking — wait longer
+                        logger.info(f"Cloudflare blocking ({cf_failures}x). Waiting 10 min...")
+                        await asyncio.sleep(600)
+                        # Try reloading page
+                        await self._load_page()
+                        cf_failures = 0
+                    else:
+                        logger.info("No statuses, reloading page...")
+                        if await self._load_page():
+                            statuses = await self._fetch_posts()
+                else:
+                    cf_failures = 0  # Reset on success
 
                 new_count = 0
                 for status in statuses:
