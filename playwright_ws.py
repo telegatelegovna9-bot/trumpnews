@@ -240,9 +240,10 @@ class PlaywrightMonitor:
         """)
 
     async def _initial_scrape(self):
-        """Wait for page content to load, then scrape and mark existing posts."""
+        """Wait for page content to load, scrape, send latest post to Telegram, mark rest as seen."""
         # Wait for posts to load in the DOM (SPA needs time to render)
         logger.info("Waiting for posts to load in DOM...")
+        statuses = []
         for i in range(10):
             await asyncio.sleep(3)
             statuses = await self._scrape_posts()
@@ -256,7 +257,39 @@ class PlaywrightMonitor:
                 break
             logger.debug(f"Still waiting for posts... ({(i+1)*3}s)")
 
-        # Mark as seen
+        if not statuses:
+            logger.warning("No posts found during initial scrape")
+            return
+
+        # Send the LATEST (first) post to Telegram as a test
+        latest = statuses[0]
+        post_id = str(latest.get("id", ""))
+        content = strip_html(latest.get("content", ""))
+
+        post = Post(
+            id=post_id,
+            username=self.username,
+            content=content,
+            created_at=latest.get("created_at", ""),
+            url=latest.get("url", f"https://truthsocial.com/@{self.username}/{post_id}"),
+            sensitive=latest.get("sensitive", False),
+            spoiler_text=latest.get("spoiler_text", ""),
+            media_urls=[
+                m.get("url", "")
+                for m in latest.get("media_attachments", [])
+                if m.get("url")
+            ],
+            source="startup_latest",
+        )
+
+        # Take screenshot of the latest post
+        post.screenshot_path = await self._take_screenshot(post_id)
+
+        # Send to Telegram
+        await self.on_post(post)
+        logger.info(f"Sent latest post {post_id} to Telegram")
+
+        # Mark ALL posts as seen (including the one we just sent)
         for s in statuses:
             self._seen_ids.add(str(s.get("id", "")))
         logger.info(f"Marked {len(self._seen_ids)} existing posts as seen")
