@@ -89,13 +89,57 @@ class PlaywrightMonitor:
             )
             self._page = await self._context.new_page()
 
+            # Stealth: hide webdriver flag from Cloudflare
+            await self._page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                window.chrome = { runtime: {} };
+            """)
+
             # Setup CDP for WebSocket frame interception
             await self._setup_ws_interception()
 
             # Navigate to profile page
             url = TRUTHSOCIAL_URL.format(username=self.username)
             logger.info(f"Playwright: navigating to {url}")
-            await self._page.goto(url, wait_until="networkidle", timeout=60000)
+
+            # Use domcontentloaded instead of networkidle — networkidle hangs
+            # because Truth Social keeps WS connections open forever
+            try:
+                await self._page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as nav_err:
+                logger.warning(f"Playwright: navigation failed: {nav_err}")
+                # Try loading just the API directly
+                logger.info("Playwright: trying API endpoint directly...")
+                try:
+                    await self._page.goto(
+                        f"https://truthsocial.com/api/v1/accounts/lookup?acct={self.username}",
+                        wait_until="commit",
+                        timeout=15000,
+                    )
+                    logger.info("Playwright: API endpoint loaded")
+                except Exception as api_err:
+                    logger.error(f"Playwright: API endpoint also failed: {api_err}")
+                    raise
+
+            # Wait for Cloudflare challenge to resolve (if any)
+            await asyncio.sleep(3)
+
+            # Check if we're past Cloudflare
+            try:
+                page_title = await self._page.title()
+                logger.info(f"Playwright: page title = {page_title}")
+
+                if "Just a moment" in page_title or "Cloudflare" in page_title:
+                    logger.info("Playwright: waiting for Cloudflare challenge...")
+                    await asyncio.sleep(10)
+                    # Try reload
+                    await self._page.reload(wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(5)
+            except Exception:
+                pass  # Title check is best-effort
+
             logger.info("Playwright: page loaded")
 
             # Get account ID from API
@@ -216,19 +260,30 @@ class PlaywrightMonitor:
                 await asyncio.sleep(1)
 
     async def _fetch_account_id(self):
-        """Fetch account ID via API."""
-        try:
-            resp = await self._page.evaluate(
-                """async (url) => {
-                    const r = await fetch(url);
-                    return await r.json();
-                }""",
-                TRUTHSOCIAL_API.format(username=self.username),
-            )
-            self._account_id = str(resp.get("id", ""))
-            logger.info(f"Playwright: account ID = {self._account_id}")
-        except Exception as e:
-            logger.error(f"Playwright: failed to get account ID: {e}")
+        """Fetch account ID via API. Retries up to 3 times."""
+        for attempt in range(3):
+            try:
+                resp = await self._page.evaluate(
+                    """async (url) => {
+                        const r = await fetch(url);
+                        if (!r.ok) throw new Error('HTTP ' + r.status);
+                        return await r.json();
+                    }""",
+                    TRUTHSOCIAL_API.format(username=self.username),
+                )
+                self._account_id = str(resp.get("id", ""))
+                if self._account_id:
+                    logger.info(f"Playwright: account ID = {self._account_id}")
+                    return
+                else:
+                    logger.warning(f"Playwright: API returned empty account ID (attempt {attempt+1})")
+            except Exception as e:
+                logger.warning(f"Playwright: failed to get account ID (attempt {attempt+1}): {e}")
+
+            if attempt < 2:
+                await asyncio.sleep(5)
+
+        logger.error("Playwright: could not fetch account ID after 3 attempts")
 
     async def _initial_fetch(self):
         """Mark existing posts as seen."""
@@ -239,11 +294,20 @@ class PlaywrightMonitor:
             url = TRUTHSOCIAL_TIMELINE.format(account_id=self._account_id)
             resp = await self._page.evaluate(
                 """async (url) => {
-                    const r = await fetch(url);
-                    return await r.json();
+                    try {
+                        const r = await fetch(url);
+                        if (!r.ok) return { error: 'HTTP ' + r.status };
+                        return await r.json();
+                    } catch(e) {
+                        return { error: e.message };
+                    }
                 }""",
                 url,
             )
+
+            if isinstance(resp, dict) and resp.get("error"):
+                logger.warning(f"Playwright initial fetch: API error: {resp['error']}")
+                return
 
             if isinstance(resp, list):
                 for status in resp:
@@ -268,16 +332,32 @@ class PlaywrightMonitor:
     async def _poll(self):
         """Poll for new posts via API."""
         if not self._account_id:
-            return
+            # Try to get account ID if we don't have it
+            await self._fetch_account_id()
+            if not self._account_id:
+                return
 
         url = TRUTHSOCIAL_TIMELINE.format(account_id=self._account_id)
-        resp = await self._page.evaluate(
-            """async (url) => {
-                const r = await fetch(url);
-                return await r.json();
-            }""",
-            url,
-        )
+        try:
+            resp = await self._page.evaluate(
+                """async (url) => {
+                    try {
+                        const r = await fetch(url);
+                        if (!r.ok) return { error: 'HTTP ' + r.status };
+                        return await r.json();
+                    } catch(e) {
+                        return { error: e.message };
+                    }
+                }""",
+                url,
+            )
+        except Exception as e:
+            logger.error(f"Playwright poll: evaluate failed: {e}")
+            return
+
+        if isinstance(resp, dict) and resp.get("error"):
+            logger.warning(f"Playwright poll: API error: {resp['error']}")
+            return
 
         if not isinstance(resp, list):
             return
@@ -319,8 +399,8 @@ class PlaywrightMonitor:
         """Take a screenshot of a specific post on the profile page."""
         try:
             # Reload the page to see the post
-            await self._page.reload(wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(2)
+            await self._page.reload(wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
 
             # Try to find the post element by data attribute or link
             post_url = f"/@{self.username}/{post_id}"

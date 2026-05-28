@@ -4,6 +4,9 @@ truthbrush is a dedicated Python library for Truth Social that handles
 Cloudflare protection out of the box. It provides fast API access for polling.
 
 This is our Fallback method — polls every 60 seconds.
+
+NOTE: truthbrush REQUIRES Truth Social credentials (username + password).
+Without credentials, this poller disables itself gracefully.
 """
 import asyncio
 import logging
@@ -13,6 +16,17 @@ from typing import Callable, Optional
 from models import Post
 
 logger = logging.getLogger(__name__)
+
+
+def strip_html(html: str) -> str:
+    """Remove HTML tags and decode entities."""
+    text = re.sub(r"<[^>]+>", "", html).strip()
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"&lt;", "<", text)
+    text = re.sub(r"&gt;", ">", text)
+    text = re.sub(r"&quot;", '"', text)
+    text = re.sub(r"&#39;", "'", text)
+    return text
 
 
 class TruthbrushPoller:
@@ -39,19 +53,24 @@ class TruthbrushPoller:
 
     async def _init_api(self):
         """Initialize truthbrush API client."""
+        # truthbrush requires credentials — check upfront
+        if not self._truthsocial_username or not self._truthsocial_password:
+            logger.warning(
+                "truthbrush: no credentials provided. "
+                "Set TRUTHSOCIAL_LOGIN_USERNAME and TRUTHSOCIAL_LOGIN_PASSWORD in .env "
+                "to enable truthbrush polling. Disabling poller."
+            )
+            self._initialized = False
+            return
+
         try:
             from truthbrush import Api
 
-            if self._truthsocial_username and self._truthsocial_password:
-                self._api = Api(
-                    username=self._truthsocial_username,
-                    password=self._truthsocial_password,
-                )
-                logger.info("truthbrush: logged in with credentials")
-            else:
-                # Try without auth (public endpoints)
-                self._api = Api()
-                logger.info("truthbrush: using anonymous access")
+            self._api = Api(
+                username=self._truthsocial_username,
+                password=self._truthsocial_password,
+            )
+            logger.info("truthbrush: logged in with credentials")
 
             # Lookup account ID
             loop = asyncio.get_event_loop()
@@ -119,13 +138,7 @@ class TruthbrushPoller:
             self._seen_ids.add(post_id)
             new_count += 1
 
-            content = status.get("content", "")
-            content = re.sub(r"<[^>]+>", "", content).strip()
-            content = re.sub(r"&amp;", "&", content)
-            content = re.sub(r"&lt;", "<", content)
-            content = re.sub(r"&gt;", ">", content)
-            content = re.sub(r"&quot;", '"', content)
-            content = re.sub(r"&#39;", "'", content)
+            content = strip_html(status.get("content", ""))
 
             post = Post(
                 id=post_id,

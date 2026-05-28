@@ -94,12 +94,23 @@ class TrumpMonitor:
             thread_id=self.thread_id,
         )
 
+        # Log which methods are available
+        has_ts_creds = bool(self.ts_username and self.ts_password)
+        logger.info(f"Truth Social credentials: {'provided' if has_ts_creds else 'NOT provided (truthbrush disabled)'}")
+        logger.info(f"WebSocket streaming: will attempt (needs auth)")
+        logger.info(f"Playwright: enabled (primary method)")
+
         # Send startup message
+        methods = "Playwright (primary)"
+        if has_ts_creds:
+            methods += " + truthbrush"
+        methods += " + WS (attempt)"
+
         await self.notifier.send_status(
             f"🚀 Мониторинг запущен!\n"
             f"👤 @{self.username}\n"
             f"⏱ Интервал опроса: {self.poll_interval}с\n"
-            f"📡 Методы: WebSocket + Playwright + truthbrush"
+            f"📡 Методы: {methods}"
         )
 
         # Start all detection methods in parallel + queue processor
@@ -208,17 +219,32 @@ class TrumpMonitor:
             logger.error(f"truthbrush poller crashed: {e}", exc_info=True)
 
     async def _run_playwright(self):
-        """Run Playwright monitor (WS interception + polling)."""
-        try:
-            self.playwright = PlaywrightMonitor(
-                username=self.username,
-                on_post=self._on_post_detected,
-                interval=self.poll_interval,
-            )
-            logger.info("Starting Playwright monitor...")
-            await self.playwright.start()
-        except Exception as e:
-            logger.error(f"Playwright monitor crashed: {e}", exc_info=True)
+        """Run Playwright monitor (WS interception + polling).
+        
+        Retries on failure with exponential backoff.
+        """
+        max_retries = 5
+        retry_delay = 30
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.playwright = PlaywrightMonitor(
+                    username=self.username,
+                    on_post=self._on_post_detected,
+                    interval=self.poll_interval,
+                )
+                logger.info(f"Starting Playwright monitor (attempt {attempt}/{max_retries})...")
+                await self.playwright.start()
+                # If we get here, Playwright exited normally
+                break
+            except Exception as e:
+                logger.error(f"Playwright monitor crashed (attempt {attempt}): {e}", exc_info=True)
+                if attempt < max_retries:
+                    logger.info(f"Retrying Playwright in {retry_delay}s...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 300)
+                else:
+                    logger.error("Playwright monitor: max retries reached. Giving up.")
 
     async def stop(self):
         """Gracefully stop all components."""

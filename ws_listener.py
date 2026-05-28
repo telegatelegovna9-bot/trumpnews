@@ -5,6 +5,10 @@ from a specific account. This provides near real-time detection (1-5 seconds).
 
 Truth Social is built on Mastodon, so it supports the standard streaming API.
 The public:local stream shows all public posts — we filter by username.
+
+NOTE: The streaming API requires an OAuth access token. Without authentication
+the server returns HTTP 403. This listener will disable itself after the first
+403 to avoid spamming the server with reconnection attempts.
 """
 import asyncio
 import json
@@ -34,19 +38,32 @@ class WSListener:
         self.on_post = on_post
         self.access_token = access_token
         self._running = False
-        self._reconnect_delay = 5
+        self._disabled = False  # Set to True if 403 received
 
     async def start(self):
         """Start listening on the WebSocket stream."""
         self._running = True
-        while self._running:
+
+        if not self.access_token:
+            logger.warning("WS: no access token — streaming API requires auth. Disabling WS listener.")
+            self._disabled = True
+            return
+
+        reconnect_delay = 5
+        while self._running and not self._disabled:
             try:
                 await self._listen()
             except Exception as e:
-                logger.warning(f"WS error: {e}. Reconnecting in {self._reconnect_delay}s...")
-                await asyncio.sleep(self._reconnect_delay)
-                # Exponential backoff capped at 60s
-                self._reconnect_delay = min(self._reconnect_delay * 1.5, 60)
+                err_str = str(e)
+                # 403 means auth required — stop retrying
+                if "403" in err_str or "401" in err_str:
+                    logger.warning(f"WS: got {err_str} — streaming requires auth. Disabling WS listener.")
+                    self._disabled = True
+                    return
+
+                logger.warning(f"WS error: {e}. Reconnecting in {reconnect_delay}s...")
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, 60)
 
     async def _listen(self):
         """Connect and listen for messages."""
@@ -54,10 +71,7 @@ class WSListener:
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
 
-        # Subscribe to public timeline (all public posts)
-        # We filter by username client-side
         stream_url = f"{TRUTHSOCIAL_WS}?stream=public:local"
-
         logger.info(f"WS connecting to {stream_url}")
 
         async with websockets.connect(
@@ -67,7 +81,6 @@ class WSListener:
             ping_timeout=10,
             close_timeout=5,
         ) as ws:
-            self._reconnect_delay = 5  # Reset on successful connect
             logger.info("WS connected to Truth Social streaming")
 
             async for message in ws:
@@ -87,7 +100,6 @@ class WSListener:
         event = data.get("event", "")
         payload_str = data.get("payload", "{}")
 
-        # Mastodon streaming API sends events like "update", "delete", etc.
         if event != "update":
             return
 
@@ -96,7 +108,6 @@ class WSListener:
         except (json.JSONDecodeError, TypeError):
             return
 
-        # Check if this post is from our target user
         account = payload.get("account", {})
         acct = account.get("acct", "").lower()
         username = account.get("username", "").lower()
@@ -108,7 +119,6 @@ class WSListener:
         if not post_id:
             return
 
-        # Strip HTML tags from content
         content = payload.get("content", "")
         content = re.sub(r"<[^>]+>", "", content).strip()
         content = re.sub(r"&amp;", "&", content)
@@ -122,7 +132,6 @@ class WSListener:
         sensitive = payload.get("sensitive", False)
         spoiler_text = payload.get("spoiler_text", "")
 
-        # Extract media URLs
         media_urls = []
         for media in payload.get("media_attachments", []):
             media_url = media.get("url") or media.get("preview_url")
@@ -142,7 +151,6 @@ class WSListener:
         )
 
         logger.info(f"WS new post from @{self.username}: {post_id}")
-        self._reconnect_delay = 5
         await self.on_post(post)
 
     def stop(self):
