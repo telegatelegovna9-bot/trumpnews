@@ -18,6 +18,12 @@ TRUTHSOCIAL_API = "https://truthsocial.com/api/v1/accounts/lookup?acct={username
 TRUTHSOCIAL_TIMELINE = "https://truthsocial.com/api/v1/accounts/{account_id}/statuses?limit=20"
 TRUTHSOCIAL_URL = "https://truthsocial.com/@{username}"
 
+# Proxy support — set PROXY_URL in .env
+# Examples:
+#   http://user:pass@proxy.example.com:8080
+#   socks5://user:pass@proxy.example.com:1080
+PROXY_URL = os.getenv("PROXY_URL", "")
+
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
@@ -103,7 +109,12 @@ class PlaywrightMonitor:
             from playwright.async_api import async_playwright
 
             pw = await async_playwright().start()
-            browser = await pw.firefox.launch(headless=True)
+
+            launch_args = {}
+            if PROXY_URL:
+                launch_args["proxy"] = {"server": PROXY_URL}
+
+            browser = await pw.firefox.launch(headless=True, **launch_args)
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
@@ -166,7 +177,11 @@ class PlaywrightMonitor:
 
             for profile in profiles:
                 try:
-                    self._scraper = Session(impersonate=profile, headers=HEADERS)
+                    kwargs = {"impersonate": profile, "headers": HEADERS}
+                    if PROXY_URL:
+                        kwargs["proxies"] = {"https": PROXY_URL, "http": PROXY_URL}
+
+                    self._scraper = Session(**kwargs)
                     # Quick test
                     resp = self._scraper.get("https://truthsocial.com/", timeout=10)
                     logger.info(f"curl_cffi {profile}: HTTP {resp.status_code}")
@@ -179,7 +194,10 @@ class PlaywrightMonitor:
 
             # All profiles got 403 — use last one anyway
             logger.warning("All profiles got 403, using chrome131 anyway")
-            self._scraper = Session(impersonate="chrome131", headers=HEADERS)
+            kwargs = {"impersonate": "chrome131", "headers": HEADERS}
+            if PROXY_URL:
+                kwargs["proxies"] = {"https": PROXY_URL, "http": PROXY_URL}
+            self._scraper = Session(**kwargs)
             return True
 
         except ImportError:
