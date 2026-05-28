@@ -240,33 +240,91 @@ class PlaywrightMonitor:
         """)
 
     async def _initial_scrape(self):
-        """Scrape page and mark existing posts as seen."""
-        statuses = await self._scrape_posts()
+        """Wait for page content to load, then scrape and mark existing posts."""
+        # Wait for posts to load in the DOM (SPA needs time to render)
+        logger.info("Waiting for posts to load in DOM...")
+        for i in range(10):
+            await asyncio.sleep(3)
+            statuses = await self._scrape_posts()
+            if statuses:
+                logger.info(f"Posts loaded after {(i+1)*3}s")
+                break
+            # Also try fetching via API (browser has cf_clearance cookie now)
+            statuses = await self._fetch_via_browser_api()
+            if statuses:
+                logger.info(f"API fetched {len(statuses)} posts after {(i+1)*3}s")
+                break
+            logger.debug(f"Still waiting for posts... ({(i+1)*3}s)")
+
+        # Mark as seen
         for s in statuses:
             self._seen_ids.add(str(s.get("id", "")))
         logger.info(f"Marked {len(self._seen_ids)} existing posts as seen")
 
+    async def _fetch_via_browser_api(self) -> list:
+        """Fetch posts using the browser's fetch API (has cf_clearance cookie)."""
+        try:
+            # First get account ID
+            account_data = await self._page.evaluate("""
+                async () => {
+                    try {
+                        const r = await fetch('/api/v1/accounts/lookup?acct=realdonaldtrump', { credentials: 'include' });
+                        if (!r.ok) return { error: r.status };
+                        return await r.json();
+                    } catch(e) { return { error: e.message }; }
+                }
+            """)
+
+            if isinstance(account_data, dict) and account_data.get("error"):
+                logger.debug(f"Browser API lookup: {account_data['error']}")
+                return []
+
+            account_id = str(account_data.get("id", ""))
+            if not account_id:
+                return []
+
+            logger.info(f"Browser API: account ID = {account_id}")
+
+            # Then fetch statuses
+            statuses = await self._page.evaluate("""
+                async (accountId) => {
+                    try {
+                        const r = await fetch('/api/v1/accounts/' + accountId + '/statuses?limit=20', { credentials: 'include' });
+                        if (!r.ok) return { error: r.status };
+                        return await r.json();
+                    } catch(e) { return { error: e.message }; }
+                }
+            """, account_id)
+
+            if isinstance(statuses, dict) and statuses.get("error"):
+                logger.debug(f"Browser API statuses: {statuses['error']}")
+                return []
+
+            if isinstance(statuses, list):
+                logger.info(f"Browser API: got {len(statuses)} statuses")
+                return statuses
+
+        except Exception as e:
+            logger.error(f"Browser API error: {e}")
+        return []
+
     async def _poll_loop(self):
-        """Main polling loop — scrape page every interval."""
+        """Main polling loop — try browser API first, then DOM scraping."""
         await asyncio.sleep(5)
 
         while self._running:
             try:
-                # Reload page to get fresh content
-                try:
-                    await self._page.reload(wait_until="domcontentloaded", timeout=20000)
-                    await asyncio.sleep(3)
-                except Exception as e:
-                    logger.warning(f"Page reload error: {e}")
-                    # Try navigating again
+                # Method 1: Fetch via browser API (fast, has cookies)
+                statuses = await self._fetch_via_browser_api()
+
+                # Method 2: DOM scraping (fallback)
+                if not statuses:
                     try:
-                        url = TRUTHSOCIAL_URL.format(username=self.username)
-                        await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                        await asyncio.sleep(3)
+                        await self._page.reload(wait_until="domcontentloaded", timeout=20000)
+                        await asyncio.sleep(5)
                     except Exception:
                         pass
-
-                statuses = await self._scrape_posts()
+                    statuses = await self._scrape_posts()
 
                 new_count = 0
                 for status in statuses:
