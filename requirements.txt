@@ -8,10 +8,13 @@ truthbrush>=0.2.0
 # WebSocket streaming
 websockets>=12.0
 
-# Browser automation (screenshots only)
+# Browser automation (screenshots + DOM scraping)
 playwright>=1.40.0
 
-# HTTP client with browser TLS fingerprint (Cloudflare bypass)
+# Cloudflare bypass
+cloudscraper>=1.2.71
+
+# HTTP client with browser TLS fingerprint
 curl_cffi>=0.7.0
 
 # Translation & NLP
