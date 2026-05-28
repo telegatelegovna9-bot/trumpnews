@@ -2,7 +2,13 @@ FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
 
 WORKDIR /app
 
-# Install dependencies
+# Install system deps for curl_cffi (libcurl, libffi)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libcurl4-openssl-dev \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
