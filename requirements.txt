@@ -17,3 +17,6 @@ pyvirtualdisplay>=3.0
 # Translation & NLP
 deep-translator>=1.11.0
 textblob>=0.18.0
+
+# Image processing (screenshot cropping)
+Pillow>=10.0.0

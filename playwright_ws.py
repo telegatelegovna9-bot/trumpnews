@@ -303,19 +303,107 @@ class PlaywrightMonitor:
             await self._page.goto(post_url, wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(3)
 
-            post_el = await self._page.query_selector("article, .status-body")
             filepath = os.path.join(self.screenshot_dir, f"post_{post_id}_{int(datetime.now().timestamp())}.png")
 
-            if post_el:
-                await post_el.screenshot(path=filepath)
-            else:
-                await self._page.screenshot(path=filepath, full_page=False)
+            # Try to find the post element with multiple selectors
+            post_el = None
+            selectors = [
+                "article",
+                ".status-body",
+                "[data-testid='status']",
+                "div[class*='status']",
+                "div[class*='post']",
+            ]
+            for sel in selectors:
+                post_el = await self._page.query_selector(sel)
+                if post_el:
+                    # Verify it's actually the post (not navbar etc)
+                    box = await post_el.bounding_box()
+                    if box and box['height'] > 100 and box['width'] > 200:
+                        logger.debug(f"Found post element with selector: {sel}")
+                        break
+                    post_el = None
 
-            logger.info(f"Screenshot: {filepath}")
+            if post_el:
+                # Screenshot just the post element
+                await post_el.screenshot(path=filepath)
+                logger.info(f"Screenshot (cropped): {filepath}")
+            else:
+                # Fallback: full page screenshot + crop with Pillow
+                full_path = filepath + ".full.png"
+                await self._page.screenshot(path=full_path, full_page=False)
+                filepath = await self._crop_screenshot(full_path, filepath, post_id)
+                logger.info(f"Screenshot (cropped from full): {filepath}")
+
             return filepath
         except Exception as e:
             logger.error(f"Screenshot error: {e}")
             return None
+
+    async def _crop_screenshot(self, full_path: str, output_path: str, post_id: str) -> str:
+        """Crop full page screenshot to just the post area using Pillow."""
+        try:
+            from PIL import Image
+
+            img = Image.open(full_path)
+            width, height = img.size
+
+            # Find the post element's position on the page
+            box = await self._page.evaluate("""
+                (postId) => {
+                    // Try to find the post container
+                    const selectors = ['article', '.status-body', '[data-testid="status"]', 'div[class*="status"]'];
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.height > 100 && rect.width > 200) {
+                                return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+                            }
+                        }
+                    }
+                    // Fallback: crop center of page
+                    return null;
+                }
+            """, post_id)
+
+            if box and box.get('height', 0) > 50:
+                # Crop to the post element
+                left = max(0, int(box['x']))
+                top = max(0, int(box['y']))
+                right = min(width, int(box['x'] + box['width']))
+                bottom = min(height, int(box['y'] + box['height']))
+                cropped = img.crop((left, top, right, bottom))
+                cropped.save(output_path)
+            else:
+                # Fallback: crop center portion of the page (typical post area)
+                # Remove navbar (top ~60px) and sidebar, keep center column
+                left = max(0, width // 2 - 400)
+                top = 60
+                right = min(width, width // 2 + 400)
+                bottom = min(height, height - 50)
+                cropped = img.crop((left, top, right, bottom))
+                cropped.save(output_path)
+
+            # Clean up full screenshot
+            try:
+                os.remove(full_path)
+            except Exception:
+                pass
+
+            return output_path
+
+        except ImportError:
+            logger.warning("Pillow not installed, using full screenshot")
+            os.rename(full_path, output_path)
+            return output_path
+        except Exception as e:
+            logger.error(f"Crop error: {e}")
+            try:
+                os.rename(full_path, output_path)
+            except Exception:
+                pass
+            return output_path
 
     def stop(self):
         self._running = False
