@@ -115,8 +115,9 @@ class PlaywrightMonitor:
         for attempt in range(3):
             try:
                 logger.info(f"Loading page (attempt {attempt+1}/3)...")
-                await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(5)
+                # Use commit — earliest state, just wait for first HTTP response
+                await self._page.goto(url, wait_until="commit", timeout=30000)
+                await asyncio.sleep(3)
 
                 title = await self._page.title()
                 logger.info(f"Page title: {title}")
@@ -125,20 +126,28 @@ class PlaywrightMonitor:
                     logger.info("Cloudflare passed!")
                     return True
 
-                # Wait more — sometimes it auto-resolves
+                # Wait for Cloudflare to auto-resolve
                 logger.info("Waiting for Cloudflare...")
-                for i in range(6):
+                for i in range(12):  # 60 seconds
                     await asyncio.sleep(5)
                     title = await self._page.title()
                     if "Just a moment" not in title and "Cloudflare" not in title:
                         logger.info("Cloudflare passed!")
                         return True
+                    logger.debug(f"Still waiting... ({(i+1)*5}s)")
 
                 # Try reload
                 if attempt < 2:
                     logger.info("Reloading...")
-                    await self._page.reload(wait_until="domcontentloaded", timeout=20000)
-                    await asyncio.sleep(3)
+                    try:
+                        await self._page.reload(wait_until="commit", timeout=15000)
+                        await asyncio.sleep(5)
+                        title = await self._page.title()
+                        if "Just a moment" not in title and "Cloudflare" not in title:
+                            logger.info("Cloudflare passed after reload!")
+                            return True
+                    except Exception:
+                        pass
 
             except Exception as e:
                 logger.warning(f"Navigation error: {e}")
