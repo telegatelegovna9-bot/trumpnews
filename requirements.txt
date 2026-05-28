@@ -10,7 +10,6 @@ websockets>=12.0
 
 # Browser automation (screenshots only)
 playwright>=1.40.0
-playwright-stealth>=1.0.6
 
 # HTTP client with browser TLS fingerprint (Cloudflare bypass)
 curl_cffi>=0.7.0

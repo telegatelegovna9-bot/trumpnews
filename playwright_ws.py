@@ -104,7 +104,6 @@ class PlaywrightMonitor:
         """Initialize Playwright, solve Cloudflare, return True if ready."""
         try:
             from playwright.async_api import async_playwright
-            from playwright_stealth import stealth_async
 
             self._pw = await async_playwright().start()
             self._browser = await self._pw.chromium.launch(
@@ -127,8 +126,8 @@ class PlaywrightMonitor:
             )
             self._page = await self._context.new_page()
 
-            # Apply stealth patches
-            await stealth_async(self._page)
+            # Apply stealth patches (manual — no dependency on playwright_stealth version)
+            await self._apply_stealth(self._page)
             logger.info("Playwright: stealth mode enabled")
 
             # Setup CDP for WS interception
@@ -190,6 +189,84 @@ class PlaywrightMonitor:
         except Exception as e:
             logger.error(f"Playwright init error: {e}")
             return False
+
+    # ── Stealth patches (manual, no library dependency) ──────────
+
+    async def _apply_stealth(self, page):
+        """Apply stealth JavaScript to avoid bot detection."""
+        await page.add_init_script("""
+            // Hide webdriver flag
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+            // Override plugins to look like a real browser
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => {
+                    const plugins = [
+                        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+                        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+                    ];
+                    plugins.length = 3;
+                    return plugins;
+                },
+            });
+
+            // Override languages
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+            // Override platform
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+
+            // Add chrome object
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: { isInstalled: false },
+            };
+
+            // Override permissions query
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) =>
+                parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters);
+
+            // Override WebGL vendor and renderer
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) return 'Intel Inc.';
+                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter.apply(this, arguments);
+            };
+
+            // Override screen properties
+            Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+            Object.defineProperty(screen, 'availHeight', { get: () => 1080 });
+            Object.defineProperty(screen, 'width', { get: () => 1920 });
+            Object.defineProperty(screen, 'height', { get: () => 1080 });
+            Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+
+            // Override connection
+            Object.defineProperty(navigator, 'connection', {
+                get: () => ({
+                    downlink: 10,
+                    effectiveType: '4g',
+                    rtt: 50,
+                    saveData: false,
+                }),
+            });
+
+            // Override hardwareConcurrency
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+
+            // Override deviceMemory
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+            // Hide automation-related properties
+            delete navigator.__proto__.webdriver;
+        """)
+        logger.info("Playwright: stealth patches applied")
 
     # ── curl_cffi with browser cookies ───────────────────────────
 
