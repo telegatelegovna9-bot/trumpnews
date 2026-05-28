@@ -8,8 +8,11 @@ truthbrush>=0.2.0
 # WebSocket streaming
 websockets>=12.0
 
-# Browser automation
+# Browser automation (fallback)
 playwright>=1.40.0
+
+# Cloudflare bypass — TLS fingerprint impersonation
+curl_cffi>=0.7.0
 
 # Translation & NLP
 deep-translator>=1.11.0

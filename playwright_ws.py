@@ -1,7 +1,7 @@
-"""Playwright-based Truth Social monitor.
+"""Truth Social monitor — curl_cffi (primary) + Playwright (screenshots).
 
-Simple approach: load page, wait for Cloudflare, scrape DOM, take screenshots.
-No overengineering — just what works.
+curl_cffi impersonates Chrome's TLS fingerprint — bypasses Cloudflare.
+Playwright is used only for screenshots when curl_cffi works.
 """
 import asyncio
 import logging
@@ -14,7 +14,22 @@ from models import Post
 
 logger = logging.getLogger(__name__)
 
+TRUTHSOCIAL_API = "https://truthsocial.com/api/v1/accounts/lookup?acct={username}"
+TRUTHSOCIAL_TIMELINE = "https://truthsocial.com/api/v1/accounts/{account_id}/statuses?limit=20"
 TRUTHSOCIAL_URL = "https://truthsocial.com/@{username}"
+
+HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 
 def strip_html(html: str) -> str:
@@ -36,6 +51,8 @@ class PlaywrightMonitor:
         self.screenshot_dir = screenshot_dir
         self._running = False
         self._seen_ids: set = set()
+        self._account_id: Optional[str] = None
+        self._scraper = None
         self._pw = None
         self._browser = None
         self._context = None
@@ -45,141 +62,114 @@ class PlaywrightMonitor:
     async def start(self):
         self._running = True
 
-        if not await self._init_browser():
+        # Init curl_cffi
+        if not self._init_curl():
+            logger.error("curl_cffi init failed")
             return
 
-        # Try initial scrape
-        success = await self._initial_scrape()
+        # Get account ID
+        loop = asyncio.get_event_loop()
+        self._account_id = await loop.run_in_executor(None, self._fetch_account_id)
 
-        if not success:
-            # Cloudflare blocked — wait long before retrying
-            logger.info("Initial scrape failed. Waiting 10 min before polling...")
+        if not self._account_id:
+            logger.warning("First attempt failed. Retrying in 30s...")
+            await asyncio.sleep(30)
+            self._account_id = await loop.run_in_executor(None, self._fetch_account_id)
+
+        if not self._account_id:
+            logger.error("Cannot get account ID. Cloudflare is blocking.")
+            # Wait long and retry
+            logger.info("Waiting 10 min before retry...")
             await asyncio.sleep(600)
+            self._account_id = await loop.run_in_executor(None, self._fetch_account_id)
+
+        if not self._account_id:
+            logger.error("Still blocked. Giving up on curl_cffi.")
+            return
+
+        # Mark existing posts
+        await self._initial_fetch()
+
+        # Init Playwright for screenshots (best-effort)
+        await self._init_playwright()
 
         # Start polling
         await self._poll_loop()
 
-    async def _init_browser(self) -> bool:
+    def _init_curl(self) -> bool:
+        try:
+            from curl_cffi.requests import Session
+            self._scraper = Session(
+                impersonate="chrome120",
+                headers=HEADERS,
+            )
+            logger.info("curl_cffi ready (impersonate=chrome120)")
+            return True
+        except ImportError:
+            logger.error("curl_cffi not installed")
+            return False
+        except Exception as e:
+            logger.error(f"curl_cffi init error: {e}")
+            return False
+
+    def _fetch_account_id(self) -> Optional[str]:
+        try:
+            url = TRUTHSOCIAL_API.format(username=self.username)
+            resp = self._scraper.get(url, timeout=20)
+            logger.info(f"Account lookup: HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                account_id = str(data.get("id", ""))
+                if account_id:
+                    logger.info(f"Account ID: {account_id}")
+                    return account_id
+            elif resp.status_code == 403:
+                logger.warning("Cloudflare blocking (403)")
+            else:
+                logger.warning(f"Unexpected status: {resp.status_code}")
+        except Exception as e:
+            logger.error(f"Account lookup error: {e}")
+        return None
+
+    def _fetch_statuses(self) -> list:
+        if not self._account_id:
+            return []
+        try:
+            url = TRUTHSOCIAL_TIMELINE.format(account_id=self._account_id)
+            resp = self._scraper.get(url, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    return data
+            elif resp.status_code == 403:
+                logger.warning("Statuses: Cloudflare blocking (403)")
+        except Exception as e:
+            logger.error(f"Statuses error: {e}")
+        return []
+
+    async def _init_playwright(self):
         try:
             from playwright.async_api import async_playwright
-
             self._pw = await async_playwright().start()
-
-            # Firefox headless — works best with Cloudflare
-            logger.info("Starting Firefox...")
             self._browser = await self._pw.firefox.launch(headless=True)
             self._context = await self._browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-                locale="en-US",
             )
             self._page = await self._context.new_page()
-            logger.info("Firefox ready")
-            return True
-
+            logger.info("Playwright ready for screenshots")
         except Exception as e:
-            logger.error(f"Browser init error: {e}")
-            return False
+            logger.warning(f"Playwright init failed (screenshots disabled): {e}")
 
-    async def _load_page(self) -> bool:
-        """Navigate to profile page and wait for Cloudflare. Returns True if page loaded."""
-        url = TRUTHSOCIAL_URL.format(username=self.username)
-
-        for attempt in range(3):
-            try:
-                logger.info(f"Loading page (attempt {attempt+1}/3)...")
-                # Use commit — earliest state, just wait for first HTTP response
-                await self._page.goto(url, wait_until="commit", timeout=30000)
-                await asyncio.sleep(3)
-
-                title = await self._page.title()
-                logger.info(f"Page title: {title}")
-
-                if "Just a moment" not in title and "Cloudflare" not in title:
-                    logger.info("Cloudflare passed!")
-                    return True
-
-                # Wait for Cloudflare to auto-resolve
-                logger.info("Waiting for Cloudflare...")
-                for i in range(12):  # 60 seconds
-                    await asyncio.sleep(5)
-                    title = await self._page.title()
-                    if "Just a moment" not in title and "Cloudflare" not in title:
-                        logger.info("Cloudflare passed!")
-                        return True
-                    logger.debug(f"Still waiting... ({(i+1)*5}s)")
-
-                # Try reload
-                if attempt < 2:
-                    logger.info("Reloading...")
-                    try:
-                        await self._page.reload(wait_until="commit", timeout=15000)
-                        await asyncio.sleep(5)
-                        title = await self._page.title()
-                        if "Just a moment" not in title and "Cloudflare" not in title:
-                            logger.info("Cloudflare passed after reload!")
-                            return True
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                logger.warning(f"Navigation error: {e}")
-                if attempt < 2:
-                    await asyncio.sleep(10)
-
-        logger.warning("Could not pass Cloudflare")
-        return False
-
-    async def _fetch_posts(self) -> list:
-        """Fetch posts via browser API (has Cloudflare cookies)."""
-        try:
-            # Get account ID
-            account = await self._page.evaluate("""
-                async () => {
-                    const r = await fetch('/api/v1/accounts/lookup?acct=""" + self.username + """', {credentials:'include'});
-                    if (!r.ok) return null;
-                    return await r.json();
-                }
-            """)
-            if not account or not account.get("id"):
-                logger.warning("Could not get account ID")
-                return []
-
-            account_id = str(account["id"])
-            logger.info(f"Account ID: {account_id}")
-
-            # Get statuses
-            statuses = await self._page.evaluate("""
-                async (id) => {
-                    const r = await fetch('/api/v1/accounts/' + id + '/statuses?limit=20', {credentials:'include'});
-                    if (!r.ok) return [];
-                    return await r.json();
-                }
-            """, account_id)
-
-            if isinstance(statuses, list):
-                logger.info(f"Got {len(statuses)} statuses")
-                return statuses
-
-        except Exception as e:
-            logger.error(f"Fetch error: {e}")
-        return []
-
-    async def _initial_scrape(self) -> bool:
-        """Load page, fetch posts, send latest to Telegram. Returns True if successful."""
-        if not await self._load_page():
-            return False
-
-        statuses = await self._fetch_posts()
-        if not statuses:
-            await asyncio.sleep(10)
-            statuses = await self._fetch_posts()
+    async def _initial_fetch(self):
+        loop = asyncio.get_event_loop()
+        statuses = await loop.run_in_executor(None, self._fetch_statuses)
 
         if not statuses:
             logger.warning("No posts found")
-            return False
+            return
 
-        # Send latest post to Telegram
+        # Send latest post
         latest = statuses[0]
         post_id = str(latest.get("id", ""))
         content = strip_html(latest.get("content", ""))
@@ -200,36 +190,28 @@ class PlaywrightMonitor:
         await self.on_post(post)
         logger.info(f"Sent latest post {post_id}")
 
-        # Mark all as seen
         for s in statuses:
             self._seen_ids.add(str(s.get("id", "")))
         logger.info(f"Marked {len(self._seen_ids)} posts as seen")
-        return True
 
     async def _poll_loop(self):
-        """Poll for new posts."""
         await asyncio.sleep(self.interval)
         cf_failures = 0
 
         while self._running:
             try:
-                statuses = await self._fetch_posts()
+                loop = asyncio.get_event_loop()
+                statuses = await loop.run_in_executor(None, self._fetch_statuses)
 
                 if not statuses:
                     cf_failures += 1
-                    if cf_failures >= 3:
-                        # Cloudflare is blocking — wait longer
+                    if cf_failures >= 5:
                         logger.info(f"Cloudflare blocking ({cf_failures}x). Waiting 10 min...")
                         await asyncio.sleep(600)
-                        # Try reloading page
-                        await self._load_page()
                         cf_failures = 0
-                    else:
-                        logger.info("No statuses, reloading page...")
-                        if await self._load_page():
-                            statuses = await self._fetch_posts()
+                    continue
                 else:
-                    cf_failures = 0  # Reset on success
+                    cf_failures = 0
 
                 new_count = 0
                 for status in statuses:
@@ -274,105 +256,59 @@ class PlaywrightMonitor:
 
             filepath = os.path.join(self.screenshot_dir, f"post_{post_id}_{int(datetime.now().timestamp())}.png")
 
-            # Try to find the post element with multiple selectors
             post_el = None
-            selectors = [
-                "article",
-                ".status-body",
-                "[data-testid='status']",
-                "div[class*='status']",
-                "div[class*='post']",
-            ]
-            for sel in selectors:
+            for sel in ["article", ".status-body", "[data-testid='status']"]:
                 post_el = await self._page.query_selector(sel)
                 if post_el:
-                    # Verify it's actually the post (not navbar etc)
                     box = await post_el.bounding_box()
-                    if box and box['height'] > 100 and box['width'] > 200:
-                        logger.debug(f"Found post element with selector: {sel}")
+                    if box and box['height'] > 100:
                         break
                     post_el = None
 
             if post_el:
-                # Screenshot just the post element
                 await post_el.screenshot(path=filepath)
-                logger.info(f"Screenshot (cropped): {filepath}")
             else:
-                # Fallback: full page screenshot + crop with Pillow
-                full_path = filepath + ".full.png"
-                await self._page.screenshot(path=full_path, full_page=False)
-                filepath = await self._crop_screenshot(full_path, filepath, post_id)
-                logger.info(f"Screenshot (cropped from full): {filepath}")
+                await self._page.screenshot(path=filepath, full_page=False)
+                filepath = await self._crop_screenshot(filepath, filepath, post_id)
 
+            logger.info(f"Screenshot: {filepath}")
             return filepath
         except Exception as e:
             logger.error(f"Screenshot error: {e}")
             return None
 
     async def _crop_screenshot(self, full_path: str, output_path: str, post_id: str) -> str:
-        """Crop full page screenshot to just the post area using Pillow."""
         try:
             from PIL import Image
-
             img = Image.open(full_path)
             width, height = img.size
 
-            # Find the post element's position on the page
             box = await self._page.evaluate("""
-                (postId) => {
-                    // Try to find the post container
-                    const selectors = ['article', '.status-body', '[data-testid="status"]', 'div[class*="status"]'];
-                    for (const sel of selectors) {
+                () => {
+                    for (const sel of ['article', '.status-body', '[data-testid="status"]']) {
                         const el = document.querySelector(sel);
                         if (el) {
-                            const rect = el.getBoundingClientRect();
-                            if (rect.height > 100 && rect.width > 200) {
-                                return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-                            }
+                            const r = el.getBoundingClientRect();
+                            if (r.height > 100) return {x: r.x, y: r.y, w: r.width, h: r.height};
                         }
                     }
-                    // Fallback: crop center of page
                     return null;
                 }
-            """, post_id)
+            """)
 
-            if box and box.get('height', 0) > 50:
-                # Crop to the post element
-                left = max(0, int(box['x']))
-                top = max(0, int(box['y']))
-                right = min(width, int(box['x'] + box['width']))
-                bottom = min(height, int(box['y'] + box['height']))
-                cropped = img.crop((left, top, right, bottom))
+            if box and box.get('h', 0) > 50:
+                cropped = img.crop((max(0, int(box['x'])), max(0, int(box['y'])),
+                                   min(width, int(box['x'] + box['w'])), min(height, int(box['y'] + box['h']))))
                 cropped.save(output_path)
             else:
-                # Fallback: crop center portion of the page (typical post area)
-                # Remove navbar (top ~60px) and sidebar, keep center column
                 left = max(0, width // 2 - 400)
-                top = 60
-                right = min(width, width // 2 + 400)
-                bottom = min(height, height - 50)
-                cropped = img.crop((left, top, right, bottom))
+                cropped = img.crop((left, 60, min(width, left + 800), min(height, height - 50)))
                 cropped.save(output_path)
 
-            # Clean up full screenshot
-            try:
-                os.remove(full_path)
-            except Exception:
-                pass
-
-            return output_path
-
-        except ImportError:
-            logger.warning("Pillow not installed, using full screenshot")
-            os.rename(full_path, output_path)
             return output_path
         except Exception as e:
             logger.error(f"Crop error: {e}")
-            try:
-                os.rename(full_path, output_path)
-            except Exception:
-                pass
-            return output_path
+            return full_path
 
     def stop(self):
         self._running = False

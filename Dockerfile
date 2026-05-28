@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Firefox only — less detectable by Cloudflare
+# Install Firefox for screenshots
 RUN playwright install --with-deps firefox
 
 COPY . .
