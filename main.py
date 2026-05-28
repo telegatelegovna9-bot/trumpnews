@@ -110,7 +110,7 @@ class TrumpMonitor:
             return ""
 
     async def _run_playwright(self):
-        retry_delay = 30
+        retry_delay = 60  # Start with 60s to avoid Cloudflare rate limiting
         while self._running:
             try:
                 self.playwright = PlaywrightMonitor(
@@ -119,16 +119,15 @@ class TrumpMonitor:
                     interval=self.poll_interval,
                 )
                 await self.playwright.start()
-                # If Playwright exits, retry after delay
                 if self._running:
-                    logger.info(f"Playwright exited. Retrying in {retry_delay}s...")
+                    logger.info(f"Retrying in {retry_delay}s...")
                     await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, 300)
+                    retry_delay = min(retry_delay * 2, 600)  # Max 10 min
             except Exception as e:
-                logger.error(f"Playwright error: {e}")
+                logger.error(f"Error: {e}")
                 if self._running:
                     await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, 300)
+                    retry_delay = min(retry_delay * 2, 600)
 
     async def stop(self):
         self._running = False
