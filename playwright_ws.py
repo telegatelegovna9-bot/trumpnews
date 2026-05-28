@@ -1,12 +1,16 @@
-"""Hybrid monitor: curl_cffi for API polling + Playwright for screenshots.
+"""Hybrid monitor: Playwright solves Cloudflare + screenshots, curl_cffi polls API.
 
-curl_cffi impersonates Chrome's TLS fingerprint, bypassing Cloudflare.
-Playwright is used ONLY for taking screenshots (not for API requests).
+Strategy:
+1. Playwright loads the profile page and solves Cloudflare JS challenge
+2. Extract Cloudflare clearance cookies from the browser
+3. Use those cookies with curl_cffi for API polling (bypasses Cloudflare)
+4. Fallback: scrape posts directly from the page DOM if API fails
+5. Playwright also handles screenshots
 
-Architecture:
-- curl_cffi polls Truth Social API every 60 seconds (bypasses Cloudflare)
-- When a new post is found, Playwright takes a screenshot of it
-- CDP WebSocket interception is also attempted for real-time detection
+This is the most reliable approach because:
+- Playwright can solve Cloudflare JS challenges (real browser)
+- curl_cffi with cookies can make fast API requests
+- DOM scraping works even if API is blocked
 """
 import asyncio
 import json
@@ -38,7 +42,7 @@ def strip_html(html: str) -> str:
 
 
 class PlaywrightMonitor:
-    """Monitor Truth Social using curl_cffi (API) + Playwright (screenshots)."""
+    """Monitor Truth Social using Playwright (Cloudflare bypass) + curl_cffi (API with cookies)."""
 
     def __init__(
         self,
@@ -60,54 +64,9 @@ class PlaywrightMonitor:
         self._pw = None
         self._cdp = None
         self._curl_session = None
+        self._cf_cookies: list = []  # Cloudflare cookies from browser
 
         os.makedirs(screenshot_dir, exist_ok=True)
-
-    # ── curl_cffi HTTP client (Cloudflare bypass) ────────────────
-
-    def _get_curl_session(self):
-        """Get or create curl_cffi session with Chrome impersonation."""
-        if self._curl_session is None:
-            from curl_cffi.requests import Session
-            self._curl_session = Session(impersonate="chrome120")
-            logger.info("curl_cffi: session created (impersonate=chrome120)")
-        return self._curl_session
-
-    def _curl_get_json(self, url: str) -> dict | list | None:
-        """Make a GET request using curl_cffi and return JSON."""
-        try:
-            session = self._get_curl_session()
-            resp = session.get(url, timeout=15)
-            if resp.status_code == 200:
-                return resp.json()
-            else:
-                logger.warning(f"curl_cffi: {url} returned HTTP {resp.status_code}")
-                return None
-        except Exception as e:
-            logger.error(f"curl_cffi request error: {e}")
-            return None
-
-    def _fetch_account_id_sync(self) -> Optional[str]:
-        """Fetch account ID using curl_cffi."""
-        url = TRUTHSOCIAL_API.format(username=self.username)
-        data = self._curl_get_json(url)
-        if data and isinstance(data, dict):
-            account_id = str(data.get("id", ""))
-            if account_id:
-                logger.info(f"curl_cffi: account @{self.username} -> ID {account_id}")
-                return account_id
-        logger.error("curl_cffi: failed to get account ID")
-        return None
-
-    def _fetch_statuses_sync(self) -> list:
-        """Fetch latest statuses using curl_cffi."""
-        if not self._account_id:
-            return []
-        url = TRUTHSOCIAL_TIMELINE.format(account_id=self._account_id)
-        data = self._curl_get_json(url)
-        if isinstance(data, list):
-            return data
-        return []
 
     # ── Main entry point ─────────────────────────────────────────
 
@@ -115,36 +74,34 @@ class PlaywrightMonitor:
         """Start monitoring."""
         self._running = True
 
-        # Step 1: Get account ID via curl_cffi (bypasses Cloudflare)
-        loop = asyncio.get_event_loop()
-        self._account_id = await loop.run_in_executor(None, self._fetch_account_id_sync)
-
-        if not self._account_id:
-            logger.error("Cannot get account ID. Retrying in 30s...")
-            await asyncio.sleep(30)
-            self._account_id = await loop.run_in_executor(None, self._fetch_account_id_sync)
-
-        if not self._account_id:
-            logger.error("Failed to get account ID after retry. Monitor cannot work.")
+        # Step 1: Init Playwright and solve Cloudflare
+        if not await self._init_playwright():
+            logger.error("Playwright init failed. Cannot monitor.")
             return
 
-        # Step 2: Mark existing posts as seen
+        # Step 2: Extract cookies and setup curl_cffi
+        await self._setup_curl_with_cookies()
+
+        # Step 3: Get account ID (try curl_cffi first, then DOM scraping)
+        self._account_id = await self._get_account_id()
+        if not self._account_id:
+            logger.warning("Could not get account ID. Will use DOM scraping only.")
+
+        # Step 4: Mark existing posts as seen
         await self._initial_fetch()
 
-        # Step 3: Start Playwright for screenshots (best-effort)
-        playwright_ready = await self._init_playwright()
+        # Step 5: Run polling + WS interception
+        await asyncio.gather(
+            self._poll_loop(),
+            self._ws_intercept_loop(),
+            self._cookie_refresh_loop(),
+            return_exceptions=True,
+        )
 
-        # Step 4: Run polling + optional WS interception
-        tasks = [self._poll_loop()]
-        if playwright_ready:
-            tasks.append(self._ws_intercept_loop())
-
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    # ── Playwright init (for screenshots + WS interception) ──────
+    # ── Playwright init ──────────────────────────────────────────
 
     async def _init_playwright(self) -> bool:
-        """Initialize Playwright browser for screenshots. Returns True if ready."""
+        """Initialize Playwright, solve Cloudflare, return True if ready."""
         try:
             from playwright.async_api import async_playwright
             from playwright_stealth import stealth_async
@@ -157,6 +114,7 @@ class PlaywrightMonitor:
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
                 ],
             )
             self._context = await self._browser.new_context(
@@ -189,29 +147,379 @@ class PlaywrightMonitor:
 
             try:
                 await self._page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                await asyncio.sleep(5)
+            except Exception as e:
+                logger.warning(f"Playwright: navigation error: {e}")
 
+            # Wait for Cloudflare challenge
+            await asyncio.sleep(5)
+
+            try:
                 title = await self._page.title()
                 logger.info(f"Playwright: page title = {title}")
 
                 if "Just a moment" in title or "Cloudflare" in title:
-                    logger.info("Playwright: waiting for Cloudflare challenge...")
-                    await asyncio.sleep(10)
+                    logger.info("Playwright: waiting for Cloudflare challenge to solve...")
+                    # Wait up to 30 seconds for challenge to resolve
+                    for i in range(6):
+                        await asyncio.sleep(5)
+                        title = await self._page.title()
+                        if "Just a moment" not in title and "Cloudflare" not in title:
+                            logger.info(f"Playwright: Cloudflare challenge solved! Title: {title}")
+                            break
+                        logger.info(f"Playwright: still waiting for Cloudflare... ({(i+1)*5}s)")
+            except Exception:
+                pass
 
-                logger.info("Playwright: browser ready for screenshots")
-                return True
-
+            # Extract cookies
+            try:
+                cookies = await self._context.cookies()
+                self._cf_cookies = [
+                    {"name": c["name"], "value": c["value"], "domain": c["domain"], "path": c["path"]}
+                    for c in cookies
+                ]
+                logger.info(f"Playwright: extracted {len(self._cf_cookies)} cookies")
             except Exception as e:
-                logger.warning(f"Playwright: navigation failed: {e}")
-                # Even if navigation fails, we can still try screenshots later
-                return True
+                logger.warning(f"Playwright: cookie extraction failed: {e}")
+
+            logger.info("Playwright: browser ready")
+            return True
 
         except ImportError as e:
-            logger.warning(f"Playwright not available: {e}")
+            logger.error(f"Playwright not available: {e}")
             return False
         except Exception as e:
             logger.error(f"Playwright init error: {e}")
             return False
+
+    # ── curl_cffi with browser cookies ───────────────────────────
+
+    async def _setup_curl_with_cookies(self):
+        """Setup curl_cffi session with cookies from Playwright."""
+        try:
+            from curl_cffi.requests import Session
+
+            self._curl_session = Session(impersonate="chrome120")
+
+            # Add Cloudflare cookies to the session
+            for cookie in self._cf_cookies:
+                self._curl_session.cookies.set(
+                    cookie["name"],
+                    cookie["value"],
+                    domain=cookie["domain"],
+                    path=cookie["path"],
+                )
+
+            logger.info(f"curl_cffi: session created with {len(self._cf_cookies)} cookies")
+
+        except ImportError:
+            logger.warning("curl_cffi not available")
+
+    async def _get_account_id(self) -> Optional[str]:
+        """Get account ID using multiple methods."""
+        # Method 1: curl_cffi with cookies
+        if self._curl_session:
+            loop = asyncio.get_event_loop()
+            account_id = await loop.run_in_executor(None, self._fetch_account_id_curl)
+            if account_id:
+                return account_id
+
+        # Method 2: Playwright page.evaluate (browser context)
+        account_id = await self._fetch_account_id_playwright()
+        if account_id:
+            return account_id
+
+        # Method 3: DOM scraping from profile page
+        account_id = await self._scrape_account_id_from_dom()
+        return account_id
+
+    def _fetch_account_id_curl(self) -> Optional[str]:
+        """Fetch account ID using curl_cffi."""
+        try:
+            url = TRUTHSOCIAL_API.format(username=self.username)
+            resp = self._curl_session.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                account_id = str(data.get("id", ""))
+                if account_id:
+                    logger.info(f"curl_cffi: account @{self.username} -> ID {account_id}")
+                    return account_id
+            logger.warning(f"curl_cffi: lookup returned HTTP {resp.status_code}")
+        except Exception as e:
+            logger.error(f"curl_cffi lookup error: {e}")
+        return None
+
+    async def _fetch_account_id_playwright(self) -> Optional[str]:
+        """Fetch account ID using Playwright's page.evaluate."""
+        if not self._page:
+            return None
+
+        for attempt in range(3):
+            try:
+                resp = await self._page.evaluate(
+                    """async (url) => {
+                        try {
+                            const r = await fetch(url, { credentials: 'include' });
+                            if (!r.ok) return { error: 'HTTP ' + r.status, status: r.status };
+                            return await r.json();
+                        } catch(e) {
+                            return { error: e.message };
+                        }
+                    }""",
+                    TRUTHSOCIAL_API.format(username=self.username),
+                )
+
+                if isinstance(resp, dict):
+                    if resp.get("error"):
+                        logger.warning(f"Playwright API: {resp['error']} (attempt {attempt+1})")
+                    else:
+                        account_id = str(resp.get("id", ""))
+                        if account_id:
+                            logger.info(f"Playwright API: account ID = {account_id}")
+                            return account_id
+
+            except Exception as e:
+                logger.warning(f"Playwright API error (attempt {attempt+1}): {e}")
+
+            if attempt < 2:
+                await asyncio.sleep(5)
+
+        return None
+
+    async def _scrape_account_id_from_dom(self) -> Optional[str]:
+        """Try to extract account ID from the profile page DOM."""
+        if not self._page:
+            return None
+
+        try:
+            # Look for account ID in page scripts or data attributes
+            account_id = await self._page.evaluate("""
+                () => {
+                    // Try to find account ID in meta tags or data attributes
+                    const meta = document.querySelector('meta[name="account-id"]');
+                    if (meta) return meta.content;
+
+                    // Try to find in script tags (Truth Social embeds data)
+                    const scripts = document.querySelectorAll('script');
+                    for (const s of scripts) {
+                        const text = s.textContent;
+                        const match = text.match(/"id"\\s*:\\s*"(\\d+)"/);
+                        if (match) return match[1];
+                    }
+
+                    // Try to find in link tags
+                    const links = document.querySelectorAll('a[href*="/api/v1/accounts/"]');
+                    for (const link of links) {
+                        const match = link.href.match(/accounts\\/(\\d+)/);
+                        if (match) return match[1];
+                    }
+
+                    return null;
+                }
+            """)
+
+            if account_id:
+                logger.info(f"DOM scraping: account ID = {account_id}")
+                return str(account_id)
+
+        except Exception as e:
+            logger.error(f"DOM scraping error: {e}")
+
+        return None
+
+    # ── Polling ──────────────────────────────────────────────────
+
+    async def _initial_fetch(self):
+        """Mark existing posts as seen."""
+        statuses = await self._fetch_statuses()
+        for status in statuses:
+            self._seen_ids.add(str(status.get("id", "")))
+        logger.info(f"Marked {len(self._seen_ids)} existing posts as seen")
+
+    async def _poll_loop(self):
+        """Poll for new posts."""
+        await asyncio.sleep(10)
+
+        while self._running:
+            try:
+                await self._poll()
+            except Exception as e:
+                logger.error(f"Poll error: {e}")
+            await asyncio.sleep(self.interval)
+
+    async def _poll(self):
+        """Poll for new posts using best available method."""
+        statuses = await self._fetch_statuses()
+
+        if not statuses:
+            return
+
+        new_count = 0
+        for status in statuses:
+            post_id = str(status.get("id", ""))
+            if post_id in self._seen_ids:
+                continue
+
+            self._seen_ids.add(post_id)
+            new_count += 1
+
+            content = strip_html(status.get("content", ""))
+
+            post = Post(
+                id=post_id,
+                username=self.username,
+                content=content,
+                created_at=status.get("created_at", ""),
+                url=status.get("url", f"https://truthsocial.com/@{self.username}/{post_id}"),
+                sensitive=status.get("sensitive", False),
+                spoiler_text=status.get("spoiler_text", ""),
+                media_urls=[
+                    m.get("url", "")
+                    for m in status.get("media_attachments", [])
+                    if m.get("url")
+                ],
+                source="poll",
+            )
+
+            # Take screenshot
+            post.screenshot_path = await self._take_screenshot(post_id)
+
+            await self.on_post(post)
+
+        if new_count > 0:
+            logger.info(f"Poll: {new_count} new posts")
+
+    async def _fetch_statuses(self) -> list:
+        """Fetch statuses using best available method."""
+        # Method 1: curl_cffi with cookies (fastest)
+        if self._curl_session and self._account_id:
+            loop = asyncio.get_event_loop()
+            statuses = await loop.run_in_executor(None, self._fetch_statuses_curl)
+            if statuses:
+                return statuses
+
+        # Method 2: Playwright page.evaluate
+        if self._page and self._account_id:
+            statuses = await self._fetch_statuses_playwright()
+            if statuses:
+                return statuses
+
+        # Method 3: DOM scraping (last resort)
+        return await self._scrape_statuses_from_dom()
+
+    def _fetch_statuses_curl(self) -> list:
+        """Fetch statuses using curl_cffi."""
+        try:
+            url = TRUTHSOCIAL_TIMELINE.format(account_id=self._account_id)
+            resp = self._curl_session.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    return data
+            logger.warning(f"curl_cffi: statuses returned HTTP {resp.status_code}")
+        except Exception as e:
+            logger.error(f"curl_cffi statuses error: {e}")
+        return []
+
+    async def _fetch_statuses_playwright(self) -> list:
+        """Fetch statuses using Playwright's page.evaluate."""
+        try:
+            url = TRUTHSOCIAL_TIMELINE.format(account_id=self._account_id)
+            resp = await self._page.evaluate(
+                """async (url) => {
+                    try {
+                        const r = await fetch(url, { credentials: 'include' });
+                        if (!r.ok) return { error: 'HTTP ' + r.status };
+                        return await r.json();
+                    } catch(e) {
+                        return { error: e.message };
+                    }
+                }""",
+                url,
+            )
+
+            if isinstance(resp, dict) and resp.get("error"):
+                logger.warning(f"Playwright statuses: {resp['error']}")
+                return []
+
+            if isinstance(resp, list):
+                return resp
+
+        except Exception as e:
+            logger.error(f"Playwright statuses error: {e}")
+        return []
+
+    async def _scrape_statuses_from_dom(self) -> list:
+        """Scrape statuses directly from the profile page DOM."""
+        if not self._page:
+            return []
+
+        try:
+            # Reload the page to get fresh content
+            try:
+                await self._page.reload(wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(3)
+            except Exception:
+                pass
+
+            # Extract posts from DOM
+            statuses = await self._page.evaluate("""
+                () => {
+                    const posts = [];
+                    // Truth Social uses various selectors for posts
+                    const articles = document.querySelectorAll('article, [data-testid="status"], .status-body');
+
+                    for (const article of articles) {
+                        try {
+                            // Try to get post ID from link
+                            const links = article.querySelectorAll('a[href*="/@realDonaldTrump/"]');
+                            let postId = null;
+                            let postUrl = null;
+
+                            for (const link of links) {
+                                const match = link.href.match(/\\/(\\d+)$/);
+                                if (match) {
+                                    postId = match[1];
+                                    postUrl = link.href;
+                                    break;
+                                }
+                            }
+
+                            if (!postId) continue;
+
+                            // Get content
+                            const contentEl = article.querySelector('.status-content, [data-testid="status-content"], p');
+                            const content = contentEl ? contentEl.textContent.trim() : '';
+
+                            // Get timestamp
+                            const timeEl = article.querySelector('time');
+                            const createdAt = timeEl ? timeEl.getAttribute('datetime') || timeEl.textContent : '';
+
+                            posts.push({
+                                id: postId,
+                                content: content,
+                                created_at: createdAt,
+                                url: postUrl || `https://truthsocial.com/@realDonaldTrump/${postId}`,
+                                account: { acct: 'realDonaldTrump', username: 'realDonaldTrump' },
+                                media_attachments: [],
+                                sensitive: false,
+                                spoiler_text: ''
+                            });
+                        } catch(e) {
+                            // Skip this article
+                        }
+                    }
+
+                    return posts;
+                }
+            """)
+
+            if statuses:
+                logger.info(f"DOM scraping: found {len(statuses)} posts")
+            return statuses
+
+        except Exception as e:
+            logger.error(f"DOM scraping error: {e}")
+        return []
 
     # ── WebSocket interception (via CDP) ─────────────────────────
 
@@ -258,7 +566,6 @@ class PlaywrightMonitor:
             )
 
             logger.info(f"WS intercepted new post: {post_id}")
-            # Schedule async handler
             asyncio.create_task(self._handle_ws_post(post))
 
         except (json.JSONDecodeError, Exception):
@@ -273,11 +580,10 @@ class PlaywrightMonitor:
         await self.on_post(post)
 
     async def _ws_intercept_loop(self):
-        """Keep the browser alive for WS interception and screenshots."""
+        """Keep the browser alive for WS interception."""
         while self._running:
             try:
-                # Periodically refresh the page to keep it alive
-                await asyncio.sleep(300)  # every 5 min
+                await asyncio.sleep(300)
                 if self._page and self._running:
                     try:
                         await self._page.reload(wait_until="domcontentloaded", timeout=15000)
@@ -288,73 +594,35 @@ class PlaywrightMonitor:
             except Exception:
                 await asyncio.sleep(60)
 
-    # ── API polling via curl_cffi ────────────────────────────────
+    # ── Cookie refresh ───────────────────────────────────────────
 
-    async def _initial_fetch(self):
-        """Mark existing posts as seen (no notifications)."""
-        loop = asyncio.get_event_loop()
-        statuses = await loop.run_in_executor(None, self._fetch_statuses_sync)
-
-        for status in statuses:
-            self._seen_ids.add(str(status.get("id", "")))
-        logger.info(f"Marked {len(self._seen_ids)} existing posts as seen")
-
-    async def _poll_loop(self):
-        """Poll for new posts using curl_cffi."""
-        # Short delay before first poll
-        await asyncio.sleep(10)
-
+    async def _cookie_refresh_loop(self):
+        """Periodically refresh Cloudflare cookies."""
         while self._running:
             try:
-                await self._poll()
+                await asyncio.sleep(600)  # every 10 minutes
+                if self._context and self._running:
+                    cookies = await self._context.cookies()
+                    self._cf_cookies = [
+                        {"name": c["name"], "value": c["value"], "domain": c["domain"], "path": c["path"]}
+                        for c in cookies
+                    ]
+                    # Update curl_cffi session cookies
+                    if self._curl_session:
+                        self._curl_session.cookies.clear()
+                        for cookie in self._cf_cookies:
+                            self._curl_session.cookies.set(
+                                cookie["name"], cookie["value"],
+                                domain=cookie["domain"], path=cookie["path"],
+                            )
+                    logger.info(f"Cookies refreshed: {len(self._cf_cookies)} cookies")
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.error(f"Poll error: {e}")
-            await asyncio.sleep(self.interval)
+                logger.error(f"Cookie refresh error: {e}")
+                await asyncio.sleep(60)
 
-    async def _poll(self):
-        """Poll for new posts."""
-        loop = asyncio.get_event_loop()
-        statuses = await loop.run_in_executor(None, self._fetch_statuses_sync)
-
-        if not statuses:
-            return
-
-        new_count = 0
-        for status in statuses:
-            post_id = str(status.get("id", ""))
-            if post_id in self._seen_ids:
-                continue
-
-            self._seen_ids.add(post_id)
-            new_count += 1
-
-            content = strip_html(status.get("content", ""))
-
-            post = Post(
-                id=post_id,
-                username=self.username,
-                content=content,
-                created_at=status.get("created_at", ""),
-                url=status.get("url", f"https://truthsocial.com/@{self.username}/{post_id}"),
-                sensitive=status.get("sensitive", False),
-                spoiler_text=status.get("spoiler_text", ""),
-                media_urls=[
-                    m.get("url", "")
-                    for m in status.get("media_attachments", [])
-                    if m.get("url")
-                ],
-                source="curl_cffi_poll",
-            )
-
-            # Take screenshot via Playwright (if available)
-            post.screenshot_path = await self._take_screenshot(post_id)
-
-            await self.on_post(post)
-
-        if new_count > 0:
-            logger.info(f"Poll: {new_count} new posts")
-
-    # ── Screenshot via Playwright ────────────────────────────────
+    # ── Screenshot ───────────────────────────────────────────────
 
     async def _take_screenshot(self, post_id: str) -> Optional[str]:
         """Take a screenshot of a post using Playwright."""
@@ -362,7 +630,6 @@ class PlaywrightMonitor:
             return None
 
         try:
-            # Navigate to the post page directly
             post_url = f"https://truthsocial.com/@{self.username}/{post_id}"
             await self._page.goto(post_url, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(3)
@@ -379,7 +646,6 @@ class PlaywrightMonitor:
                 logger.info(f"Screenshot saved: {filepath}")
                 return filepath
             else:
-                # Full page screenshot as fallback
                 filepath = os.path.join(
                     self.screenshot_dir,
                     f"post_{post_id}_{int(datetime.now().timestamp())}.png",
